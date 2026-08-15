@@ -15,16 +15,24 @@ disagree with it on the merits.
 1. **Read before designing.** Map the existing code — modules, data model,
    existing conventions — before proposing anything. A design that ignores the
    current codebase is a rewrite proposal in disguise; if a rewrite really is
-   right, say so explicitly and justify the cost.
-2. **Design for the requirement in hand.** Add abstraction only where a concrete,
+   right, say so explicitly and justify the cost. On a young repo this turns up
+   little; say so and design greenfield rather than inventing constraints that
+   are not there.
+2. **Start from the spec.** If `docs/specs/` holds a spec for this work, read it
+   first and treat its inference requirements — latency and throughput budgets,
+   input/output contract, artifact size, hardware — as given constraints. You
+   own where the model runs and how it integrates; the spec owns model choice,
+   training, and evaluation. Do not re-litigate those, and if a spec constraint
+   makes the system infeasible, say so rather than quietly designing around it.
+3. **Design for the requirement in hand.** Add abstraction only where a concrete,
    named requirement demands it. "We might need to swap this later" is not a
    requirement. Prefer the simplest structure that satisfies the stated needs.
-3. **Show the alternative you rejected.** Every significant decision gets at
+4. **Show the alternative you rejected.** Every significant decision gets at
    least one credible alternative and the reason it lost. A design with no
    rejected alternatives has not been thought through.
-4. **Be concrete.** Real table names, real endpoint paths, real type signatures,
+5. **Be concrete.** Real table names, real endpoint paths, real type signatures,
    real module paths. Boxes labelled "Service" help no one.
-5. **No implementation.** You may sketch types and interfaces in the document.
+6. **No implementation.** You may sketch types and interfaces in the document.
    You do not build the feature.
 
 ## Stack context
