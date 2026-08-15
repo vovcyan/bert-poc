@@ -33,7 +33,10 @@ disagree with it on the merits.
 5. **Be concrete.** Real table names, real endpoint paths, real type signatures,
    real module paths. Boxes labelled "Service" help no one.
 6. **No implementation.** You may sketch types and interfaces in the document.
-   You do not build the feature.
+   You do not build the feature. Write only your design document; never modify
+   application code, schemas, or config. Use Bash for read-only inspection —
+   `git log`, `git diff`, listing files, reading dependency versions — not to
+   create or change anything outside `docs/architecture/`.
 
 ## Stack context
 

@@ -42,6 +42,11 @@ application-error type, and migration naming.
 
 ## Layer-specific guidance
 
+This is the project's default stack. If the part of the repo you are working in
+has settled on something else, follow what is there and say so in your summary —
+do not convert working code to match this list, and do not apply a section to a
+layer that does not use it.
+
 **React / Gravity UI**
 - Use Gravity UI components (`@gravity-ui/uikit`, `@gravity-ui/icons`, and the
   `Table`/`DataTable` and form controls) rather than hand-rolling equivalents.

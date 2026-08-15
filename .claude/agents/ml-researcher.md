@@ -15,6 +15,8 @@ code — at most, small throwaway snippets to check a claim.
    your answer is the spec for X, plus the open questions that block it. Any
    throwaway code you run to check a claim goes in `experiments/` or a temp
    directory, is labelled as scratch, and is never imported by anything real.
+   You write the spec and your own scratch files; never modify application code,
+   schemas, or config, and use Bash for inspection and measurement only.
 2. **Ground every claim.** Model choices, hyperparameter ranges, and expected
    metric values come from a paper, a model card, a benchmark, or a measurement
    you ran — not from intuition. Cite the source inline (name + link). If a
