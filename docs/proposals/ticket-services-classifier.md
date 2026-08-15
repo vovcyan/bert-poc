@@ -164,6 +164,10 @@ Related low-cost improvement: give the internal `ticket_messages` row a structur
 
 Classifier unavailable after retries → fall back to CatBoost, which we keep deployed for one release cycle after full rollout. Both unavailable → complete the workflow with no prediction and emit a metric. **A prediction failure must never fail ticket creation**; the prediction is an assistive suggestion, and the workflow is already asynchronous relative to the user.
 
+### 5.6 Where an LLM does belong
+
+Rejecting an LLM on the main path (§4) does not rule it out on the paths the classifier structurally cannot serve — a newly added service with no training data, abstentions, the near-threshold band, and out-of-distribution input. The CPU-throughput objection that decides the main path does not transfer, because fallback traffic is roughly two orders of magnitude smaller. Trigger conditions, the constrained-adjudication mode, the contamination rules, and per-case ship criteria are specified in [`docs/specs/llm-fallback-policy.md`](../specs/llm-fallback-policy.md).
+
 ---
 
 ## 6. Resource requirements
@@ -282,3 +286,5 @@ The provenance and audit schema work (§5.4) should start in week 1 regardless o
 
 - This document — decision-level summary and integration design.
 - [`docs/specs/ticket-services-classifier.md`](../specs/ticket-services-classifier.md) — the full ML specification: dataset construction, the provenance partition in detail, baselines, checkpoint analysis, training hyperparameters with sources, the complete evaluation and slicing plan, threshold selection, benchmark methodology, and all citations.
+- [`docs/specs/dataset-construction-runbook.md`](../specs/dataset-construction-runbook.md) — the executable week-1 procedure: provenance-partition SQL, gold-set sampling rules and volumes, deduplication, and sizing in both directions.
+- [`docs/specs/llm-fallback-policy.md`](../specs/llm-fallback-policy.md) — where an LLM is used and where it is not: trigger conditions, constrained adjudication, contamination rules, per-case ship criteria.
