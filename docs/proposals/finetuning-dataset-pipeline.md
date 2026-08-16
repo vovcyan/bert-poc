@@ -25,7 +25,7 @@ calling a model provider at all. The deterministic phase does most of the work a
 [measured]**, removing 48.2% of sentence instances as boilerplate at 1.2% collateral damage. Label
 auditing is a ladder of instruments ordered by cost: duplicate-conflict detection, a
 cross-validated TF-IDF baseline, confident learning, and only then an LLM judge — which on this corpus sees **6.2% of labelled rows [measured]** rather than all of
-them. Human review lands at **~200 rows and ~25 person-hours [measured on the fixture]**, and the
+them. Human review lands at **~285 rows and ~28 person-hours [measured on the fixture]**, and the
 whole build costs tens of dollars.
 
 Two design invariants carry the most weight. **Phase 2 never rewrites the text the model reads** —
@@ -87,10 +87,10 @@ All figures [measured] on the fixture.
 |---|---|---|---|---|
 | **1** | Graded label conflicts within duplicate groups | seconds | **none** | ~14 queued (9 clusters / 71 rows carry disagreeing label sets) |
 | **2** | TF-IDF + one-vs-rest LR, `GroupKFold` on dedup clusters | **113 s CPU** | **none** | feeds tiers 3 and 5 |
-| **3** | `cleanlab` 2.9.0 confident learning | seconds | **none** | **161 rows** |
+| **3** | `cleanlab` 2.9.0 confident learning | seconds | **none** | **315 rows** |
 | ~~4~~ | ~~embedding kNN + UMAP~~ | — | — | **cut — see §4.4** |
 | **5** | LLM judge, constrained adjudication with evidence spans | ~375–600 calls | **real** | **288 rows = 6.2%** |
-| **6** | Human review | ~8 person-hours | none | **~200 rows** |
+| **6** | Human review | ~11 person-hours | none | **~285 rows** |
 
 Tier numbering is kept with tier 4 struck rather than renumbered, because renumbering would
 invalidate cross-references in three documents for no benefit.
@@ -201,8 +201,27 @@ It replaces the plot at no cost.
 
 **What cutting it buys:** `sentence-transformers`, `torch` (754 MB), `umap-learn` and a
 numba/llvmlite toolchain leave the pipeline, along with a 471 MB pinned checkpoint, a mirroring
-requirement, a whole class of fitted artifact, and two decision items. The freed 56 review slots go
-to widening the tier-3 selector, which is a measured improvement rather than just a smaller queue.
+requirement, a whole class of fitted artifact, and two decision items.
+
+**It does not buy 56 review slots**, and the distinction matters. Under "corroborating only" tier 4
+routed no rows — it only reordered a capped list. What the cut frees is ~1.9 review-adjacent hours,
+the dependency stack, and a worse sort key. That reordering was the whole problem: a capped queue
+means sort order decides which rows a reviewer actually reaches, so ranking by an instrument that
+recovers fewer errors per slot demotes rows that recover more. "Corroborating only" was the same
+trade with the cost hidden.
+
+**The queue therefore grows rather than shrinks**, deliberately. The same recall curve that cut
+tier 4 says the marginal reviewer row is worth more deeper in tier 3, so the selector widens from
+`score < 0.20` to `< 0.30` — **161 → 315 flagged rows [measured]**, with `< 0.30` the natural
+stopping point because beyond it the `cleanlab` mask adds only 2 rows the score cut has not already
+taken. Queue ~200 → **~285 rows**, budget ~25 → **~28 person-hours**, buying **+14pp** (ambiguous)
+/ **+9pp** (random) injected-error recall. That is a trade for the support lead to settle against
+the real export's flag rate, not the fixture's — see D-6.
+
+**One process change came out of this**, and it is worth more than the tier: any future
+row-selection tier must now clear a gate before admission — matched-budget recall against tier 3
+over ≥3 seeds with non-overlapping spreads, plus the random-drop ablation control. **"Corroborating
+only" does not exempt a tier from it**, which is precisely how this one got in.
 
 One thing is deliberately **not** lost: the distance-to-centroid value was doubling as the
 out-of-distribution signal for [`llm-fallback-policy.md`](../specs/llm-fallback-policy.md) §2 case
@@ -256,7 +275,7 @@ specs.
 | Label audit | **`scikit-learn`** (BSD-3) + **`cleanlab` 2.9.0** (Apache-2.0) | Confident learning is the standard instrument for this and is well grounded (Northcutt et al., JAIR 2021). TF-IDF + LR was already a mandatory baseline in the parent spec — it was being computed and thrown away; here it also produces the out-of-sample probabilities tier 3 needs |
 | Dataframes | **`polars`** + Parquet/Arrow | Columnar checkpoints, stable schema at every boundary |
 | Orchestration | **GNU `make` + a `ticketds` Typer CLI** | A 20-minute single-host batch job that gets iterated on, blocked once by a human. **Temporal rejected** (payloads force file-path passing; the human pause is a file, not a signal). **DVC was the strongest rival** — rejected because its cache would put un-redacted raw text in a second place we must remember to shred, and because it cannot express "the prompt changed, reuse 4,900 of 5,013 cached responses" |
-| Human review | **Generated XLSX round-trip** (`openpyxl`), HMAC-checked | ~200 rows, ≤3 reviewers, one batch. Zero infrastructure, zero auth, and no third party sees the data. **Argilla is the named upgrade trigger** if the queue exceeds ~1,500 rows or review becomes recurring. **Prodigy rejected**: closed source in a pipeline handling personal data, per-seat cost exceeding the project's entire LLM budget |
+| Human review | **Generated XLSX round-trip** (`openpyxl`), HMAC-checked | ~285 rows, ≤3 reviewers, one batch. Zero infrastructure, zero auth, and no third party sees the data. **Argilla is the named upgrade trigger** if the queue exceeds ~1,500 rows or review becomes recurring. **Prodigy rejected**: closed source in a pipeline handling personal data, per-seat cost exceeding the project's entire LLM budget |
 
 ---
 
@@ -268,7 +287,7 @@ specs.
 | Rebuild after a code-only change | **$0** | Every response served from the replay cache |
 | Re-run the judge after a threshold tweak | **$2.60–5.20** | See below |
 | Machine | **~2 min CPU** for the cheap tiers; **2–4 h elapsed** overall | Elapsed time is batch turnaround, not compute. 4 vCPU, 8 GB RAM, **no GPU, and no model checkpoint to pin or mirror** |
-| Human | **~25 person-hours**, of which ~8 h is the review queue | Balance is the Phase-3 calibration pilot and per-phase pipeline validation |
+| Human | **~28 person-hours**, of which ~11 h is the review queue | Balance is the Phase-3 calibration pilot and per-phase pipeline validation |
 
 **Cost is not a decision variable.** A full build costs less than an hour of engineering time. Any
 review argument beginning "to save on LLM calls" should be treated with suspicion.
@@ -368,7 +387,7 @@ shrinks and the *handling* controls do not:
 | **D-3** | **Is a self-hosted LLM available in-perimeter, and at what tier?** | Infra | Needed only if D-1 is "no". The provider seam makes it a config change |
 | **D-4** | **"At most one LLM call per row" — one *attempt* or one *accepted response*, and is the budget scoped per phase?** | User | One accepted response, 3 attempts max; one-attempt-only routes ~0.2–0.5% of rows to a human for a *formatting* failure, spending reviewer time on a machine problem. And **scoped per phase**: the judge's escalating self-consistency is up to three accepted responses per judged row by design. The arithmetic makes the case better than the argument — ~576 calls over 4,622 labelled rows is **0.12 calls per labelled row**, an order of magnitude under the Phase-2 budget it would be compared against. This is a confirmation request, not a request to relax anything |
 | **D-5** | **Run tiers 1–3 on a real export in week 1** to get the true label-noise rate | ML | Do it first. Four minutes of CPU, no LLM, no human, no approval — and it sizes everything downstream, including whether Phase 3's LLM tier is worth building |
-| **D-6** | **Human budget: ~25 person-hours (~8 h queue), in addition to the ~70 h gold set** | Support lead | Confirm. **If only 70 h exist in total, spend all of it on the gold set and drop Phase 3.** Do not fund the queue out of the gold budget |
+| **D-6** | **Human budget: ~28 person-hours (~11 h queue), in addition to the ~70 h gold set** | Support lead | Confirm. **If only 70 h exist in total, spend all of it on the gold set and drop Phase 3.** Do not fund the queue out of the gold budget. The queue size is a deliberate trade (§4.4) and should be re-settled against the real export's flag rate rather than the fixture's |
 | **D-7** | **Amend runbook §6** — org-grouped temporal splitting is infeasible (§7.1) | ML + product | Adopt the measured replacement and edit the runbook |
 | **D-8** | **Who authors the `auth` vs `access-control` tie-break rules?** | Product owner | Without written rules, judge and reviewer disagree on the same rows forever. This is the taxonomy's largest error source |
 | **D-9** | **The out-of-distribution signal for the LLM fallback needs a new home** | ML | Cutting tier 4 removes the distance-to-centroid value that was incidentally serving [`llm-fallback-policy.md`](../specs/llm-fallback-policy.md) §2 case 4. The requirement stands; it belongs at **serving time**, where the production classifier already has an encoder and the threshold can be set on that model's validation set. It never belonged in a dataset pipeline. Track it against the classifier spec, not this one |
