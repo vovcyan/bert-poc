@@ -26,7 +26,7 @@ Companions, in reading order:
 |---|---|
 | [`dataset-construction-runbook.md`](./dataset-construction-runbook.md) | §7 order of operations; §6 splits (temporal, grouped, ≥1-week gap); §4.1 blindness; §4.3 dedup-before-sampling; "freeze with a content hash, never train against a live query" |
 | [`ticket-services-classifier.md`](./ticket-services-classifier.md) | §2.6 splits; §4.6 input template and the requirement that preprocessing is shared with inference; §9.5 reproducibility; §9.1 artifact list |
-| [`llm-fallback-policy.md`](./llm-fallback-policy.md) | §5 contamination rule; §4.3 prompt-cache layout; §7 residency and price tiers |
+| [`llm-fallback-policy.md`](./llm-fallback-policy.md) | §5 contamination rule; §4.3 prompt-cache layout; §7 deployment options and price tiers |
 | [`../proposals/ticket-services-classifier.md`](../proposals/ticket-services-classifier.md) | §5 Temporal shape, activity contracts, idempotency/CAS; §5.3 the Python model service; §5.4 `service_predictions` / `ticket_services_audit` |
 | [`../../data/raw/README.md`](../../data/raw/README.md) | the fixture's real shape and its deliberate dirt |
 
@@ -84,7 +84,7 @@ emit `split ∈ {val, test}` unless the config explicitly sets
 | C5 | Annotators must not see the stored value or the model's answer | runbook §4.1, spec §2.2 | two-pass blind protocol, blindness enforced by *absence of data in the file* (§5.4) |
 | C6 | Phase-1 normalisation + redaction must be the **same code** that runs at inference | spec §4.6, §9.2; proposal §5.3 | `ticketprep`, one installable package, fingerprint-checked at model-service startup (§6.5) |
 | C7 | Every LLM-produced label is model provenance and is excluded from supervised training on the same terms as CatBoost output | fallback policy §5 | mechanically enforced in `s51_split` + `s53_gates`, not by convention (§3.6) |
-| C8 | 152-FZ localisation may forbid sending ticket text to a foreign API | spec §2.9, fallback §7 | provider seam + fail-closed residency gate (§6.3), and the egress gate at `s12` (§8.2) |
+| C8 | **Whether ticket text may leave the production perimeter to a third-party API is a governance decision owned by legal, and the answer may be "no."** It is not settled today | D-3 | provider seam with a fail-closed egress gate (§6.3), and `s12` before it (§8.2). The design must make either answer a config change, not a rewrite |
 | C9 | Un-redacted production ticket text contains **personal data** — e-mail, phone, personal and legal-entity names, ИНН/ОГРН, card-like and bank/transactional digit runs — before Phase 1 completes | user brief (revised), cleaning §2.3 | zone model, retention rule, log denylist (§8) |
 | C10 | **There are no application secrets, API keys or program keys in `title`/`description`** in the real production data; the secret-scanning tier is removed from the cleaning spec. URL query strings are still stripped unconditionally, as a plain normalisation rule | user, this round | §8 is re-derived against a personal-data threat model; the entropy/secret gate is deleted, the egress gate survives on different grounds (§8.2) |
 | C11 | Phase 3 — **every tier of it, not only the LLM** — must never touch gold val/test rows | fallback §5, cleaning §4.3.8, proposal §7.2 | `s29_gold_fence` + a hard assertion + a build-failing gate (§6.7) |
@@ -129,15 +129,17 @@ getting it wrong is a rename across every import path later. §2.4.
 
 **(e) Removing secret detection (C10) does not soften §8 as much as it looks like it should.**
 The instinct after "there are no API keys in the text" is to relax the zone model. I am not
-doing that, and the reason is one line: **152-FZ is a personal-data regime and it is entirely
-untouched by this change.** What *does* change is the shape of the risk — from *instant,
-exploitable, rotatable* (a leaked key is used within hours and fixed by rotation) to *slow,
-un-revocable, and legally regulated* (a leaked name-plus-phone cannot be rotated and triggers
-a notification duty). §8 is re-derived on that basis: **the detection tier shrinks, the
-handling controls do not.** One control genuinely goes away (the entropy scan), one gets
-weaker (D-6's 30-day retention, which was partly justified by standing credential exposure),
-and one gets *stronger* (over-redaction, because with secrets gone the only remaining
-false-negative class is personal data and the only false-positive class is label signal).
+doing that, and the reason is one line: **§8 protects personal data, and this change removes
+nothing from that column.** Every name, phone number, e-mail and company identifier that was
+in the text before is still in it. What *does* change is the shape of the risk — from
+*instant, exploitable, rotatable* (a leaked key is used within hours and the exposure ends
+when you rotate it) to *slow and un-revocable* (a leaked name-plus-phone cannot be re-issued,
+and the disclosure is permanent). §8 is re-derived on that basis: **the detection tier
+shrinks, the handling controls do not.** One control genuinely goes away (the entropy scan),
+one gets weaker (D-6's 30-day retention, which was partly justified by standing credential
+exposure), and one gets *stronger* (over-redaction, because with secrets gone the only
+remaining false-negative class is personal data and the only false-positive class is label
+signal).
 
 ### 1.5 Scale, budget, wall-clock
 
@@ -813,6 +815,8 @@ write-once/object-lock policy where the backend supports it).
     "rows": 5013,
     "bytes": 2465991,
     "data_classification": "synthetic",        // synthetic | production
+    "external_llm": "allowed",                 // denied | allowed — §6.3, fail-closed
+    "legal_clearance_ref": null,               // required when production + allowed
     "exported_at": null,
     "export_query_sha256": null                // set when the input is a DB export, not a file
   },
@@ -912,7 +916,7 @@ human, the design has failed.
    hard error rather than a new API call. A miss means the recipe drifted, and you want to
    know that loudly.
 5b. Fetch the embedding checkpoint: `ticketds models pull --manifest <path>` resolves
-   `label_audit.tier4.checkpoint` **at the pinned `revision`** from the in-country mirror and
+   `label_audit.tier4.checkpoint` **at the pinned `revision`** from the internal mirror and
    verifies `weights_sha256`. The pipeline never resolves a model by name alone (§4.8).
 6. Assert `dataset_version` matches. Then re-run the metric.
 
@@ -1024,10 +1028,10 @@ inputs are unchanged prints `SKIP s20_llm_clean (input 4a91… unchanged)` and e
 | Artifact | Where | Why not git |
 |---|---|---|
 | Pipeline code, configs, prompts, taxonomy, golden test file, **manifests** | **git** | small, diffable, reviewable. The manifest in git is what makes the corpus citable from a PR |
-| Raw production export | encrypted volume in Zone R + **in-country object storage**, key = `raw/<sha256>` | PII; irreversible if leaked; git history cannot be scrubbed |
+| Raw production export | encrypted volume in Zone R + **object storage inside the production perimeter**, key = `raw/<sha256>` | PII; irreversible if leaked; git history cannot be scrubbed |
 | Interim Parquet | local only, regenerable | regenerable in 15 min of CPU |
 | **LLM replay cache** | object storage, key = the cache key | 40 MB/build, append-only, and it is the reproducibility asset (§4.3 step 4) |
-| **Embedding checkpoint** (tier 4) | in-country model mirror, key = `models/<repo>/<revision>/`; local cache in `models/` | 118 MB INT8 [measured, spec §4.5]. Never pulled from a public hub at build time — see §4.8 |
+| **Embedding checkpoint** (tier 4) | internal model mirror, key = `models/<repo>/<revision>/`; local cache in `models/` | 118 MB INT8 [measured, spec §4.5]. Never pulled from a public hub at build time — see §4.8 |
 | **Fitted vectoriser + LR + `t2_probs` + embeddings** | object storage, prefix `audit/<build_id>/` | ~10 MB/build [estimate]. Regenerable, but keeping them makes a disputed ranking auditable without a rebuild |
 | Frozen corpus + `labels.json` + `preprocess.json` + `label_audit.parquet` + `run_report` | object storage, prefix `corpus/<dataset_version>/`, object-lock where available | 3–20 MB; addressed by hash so the manifest is a complete citation |
 
@@ -1038,9 +1042,11 @@ taxes every future TypeScript clone with a 2.5 MB+ download and an lfs install s
 plain S3-compatible object storage + hashes in a git-tracked manifest**, which is what DVC's
 `.dvc` files are, minus the tool.
 
-> Residency note: the bucket must be **in-country** (C8, spec §2.9). This is not just about
-> the LLM API — a snapshot of Russian citizens' ticket text sitting in a foreign region is the
-> same problem with a slower failure mode.
+> Storage-location note: the bucket must sit **inside the production perimeter**, under the
+> same data-governance rules as the ticket database itself. C8 is usually discussed as a
+> question about the LLM API, but a snapshot of production ticket text parked in an
+> unreviewed storage account is the same question with a slower failure mode and less
+> attention on it.
 
 ### 4.8 Fitted models inside the pipeline — a new artifact class
 
@@ -1057,7 +1063,7 @@ therefore be pinned, hashed and folded into the identity of the dataset.
 | Fold assignment | `s43` | `derive(seed_root, "audit.folds", cluster_id)` | `assignment_sha256` over `(ticket_id, fold)` sorted | in `audit_t2` |
 | `t2_probs` matrix | `s43` | — | `probs_sha256` over the rounded `float32` array | `artifacts/audit/<build_id>/probs.npy` |
 | `cleanlab` ranking | `s44` | exact version pin | `ranking_sha256` | in `audit_t3` |
-| **Embedding checkpoint** | pulled, not fitted | **repo id + commit SHA (`revision`), never a branch or a bare name** | `weights_sha256` verified on pull | in-country mirror; local `models/` |
+| **Embedding checkpoint** | pulled, not fitted | **repo id + commit SHA (`revision`), never a branch or a bare name** | `weights_sha256` verified on pull | internal mirror; local `models/` |
 | Embedding matrix | `s45` | — | `embeddings_sha256` | `artifacts/audit/<build_id>/embeddings.f32.npy` |
 
 Four rules, each of which exists because of a specific way this goes wrong:
@@ -1072,8 +1078,8 @@ Four rules, each of which exists because of a specific way this goes wrong:
    model card edit and a weight change look identical from the outside. `ticketds models
    pull` refuses a config that names a checkpoint without a `revision`, exactly as the LLM
    provider refuses a floating model alias (§4.4).
-3. **The checkpoint is a residency question, not just a supply-chain one.** Downloading
-   weights is outbound traffic and is harmless; the risk is the opposite direction — a
+3. **The direction of the traffic is what matters, not its existence.** Downloading
+   weights is outbound and harmless; the risk is the opposite direction — a
    `sentence-transformers` default that phones home, or an inference client that ships text
    to a hosted embedding endpoint. **Tier 4 must run locally, on the same host, with no
    network access during `s45`.** The stage asserts this by running with egress blocked in
@@ -1267,12 +1273,12 @@ row instead of on a special 100-ticket study.
 
 | Option | Licence | Verdict |
 |---|---|---|
-| **Generated XLSX round-trip** (openpyxl, MIT) ← **chosen** | MIT | ~200 rows, ≤3 reviewers, one batch, blindness guaranteed structurally. Reviewers already have Excel. Zero infra, zero auth, zero deployment, zero residency question. Cost: ~200 lines of writer/merger + the integrity checks below |
-| **Argilla** | Apache-2.0 | The best of the servers: multi-label UI, suggestions/responses model, Python SDK. Rejected **for this build**: needs a deployed server + backend, an SSO story, and a residency review — for **~8 person-hours** of work. The cascade cut the queue by two thirds, so this rejection got *more* comfortable, not less. **This is still the named upgrade trigger**: adopt it if the queue exceeds ~1,500 rows, or reviewers exceed 3, or review becomes recurring (quarterly retrains, spec §4.8) |
+| **Generated XLSX round-trip** (openpyxl, MIT) ← **chosen** | MIT | ~200 rows, ≤3 reviewers, one batch, blindness guaranteed structurally. Reviewers already have Excel. Zero infra, zero auth, zero deployment, and no third party sees the data. Cost: ~200 lines of writer/merger + the integrity checks below |
+| **Argilla** | Apache-2.0 | The best of the servers: multi-label UI, suggestions/responses model, Python SDK. Rejected **for this build**: needs a deployed server + backend, an SSO story, and a review of where it stores ticket text — for **~8 person-hours** of work. The cascade cut the queue by two thirds, so this rejection got *more* comfortable, not less. **This is still the named upgrade trigger**: adopt it if the queue exceeds ~1,500 rows, or reviewers exceed 3, or review becomes recurring (quarterly retrains, spec §4.8) |
 | **Label Studio** (Community) | Apache-2.0 | Server + DB. Multi-label works; the two-pass blind protocol would need two projects and a manual hand-off, which is *worse* than two files. Several review-workflow features sit in the Enterprise tier |
 | **Doccano** | MIT | Lightest server, but its sequence/document-classification model does not carry the per-service evidence and two-round provenance we need without extending it |
-| **Prodigy** | commercial, per-seat [~$390–500/seat, estimate] | Excellent ergonomics and scriptable recipes. Rejected on: closed source in a residency-sensitive pipeline, per-seat cost for 3 reviewers exceeds the entire LLM budget of the project, and it solves a problem (fast keyboard-driven annotation of 50k items) that we do not have at ~200 rows |
-| **Google Sheets** | n/a | Rejected on residency and on the impossibility of controlling what a shared sheet's revision history retains |
+| **Prodigy** | commercial, per-seat [~$390–500/seat, estimate] | Excellent ergonomics and scriptable recipes. Rejected on: closed source in a pipeline that handles customer personal data, per-seat cost for 3 reviewers exceeds the entire LLM budget of the project, and it solves a problem (fast keyboard-driven annotation of 50k items) that we do not have at ~200 rows |
+| **Google Sheets** | n/a | Rejected on putting ticket text in a third-party service, and on the impossibility of controlling what a shared sheet's revision history retains |
 
 **Round-trip integrity — the boring things that actually go wrong with spreadsheets:**
 
@@ -1486,10 +1492,32 @@ Wall-clock for a full cold build: `s00`–`s12` ~3–6 min (detector/NER-bound) 
 `s40` ~20 s; `s20` and `s30` batches 20–90 min each [estimate]; `s41` seconds; **human 2–3
 days**; `s50`–`s55` ~2 min. **Machine total 2–4 h elapsed, ~15 min CPU.**
 
-### 6.3 The provider seam and 152-FZ
+### 6.3 The provider seam, and why it exists before we need it
 
-Residency (C8) is not a footnote; it may force a self-hosted model. The seam is designed for
-that from the start, and it fails **closed**.
+**The question this seam answers: may pseudonymised ticket text leave the production perimeter
+to a third-party API?** That is a governance decision owned by legal (D-3), it is not settled
+today, and **the answer may be no** — support tickets are customer personal data, and plenty
+of organisations will not let that class of data reach an external processor regardless of
+what any particular rule requires.
+
+Three properties of that situation drive the design:
+
+1. **We cannot wait for the answer.** Phases 2 and 3 are most of the LLM work and we want to
+   iterate on prompts now, against the synthetic fixture, which raises no such question.
+2. **We must not build as though the answer is yes.** A pipeline whose only path to a model is
+   `anthropic.messages.create` is a pipeline that gets rewritten if the answer is no —
+   under time pressure, at the worst moment, by someone who did not write it.
+3. **The two answers differ only in mechanics, not in semantics.** Both paths send the same
+   prompt, enforce the same JSON schema, and return the same parsed object. The difference is
+   how the request is transported and how the output is constrained.
+
+So the seam is a thin interface with two implementations, **it fails closed**, and the choice
+between them is a config value rather than a code path. That is the entire justification and
+it does not depend on which rule turns out to apply: *an unresolved governance question about
+where data may go is a reason to build the option, not a reason to guess.*
+
+The cost of building it now is roughly a day (step 13). The cost of not building it is a
+rewrite of the call layer plus a re-run of every cached response.
 
 ```python
 class LlmProvider(Protocol):
@@ -1517,7 +1545,7 @@ class LlmResponse:
 Two implementations, and the seam sits where the *semantics* are identical and only the
 mechanics differ:
 
-| | `AnthropicBatchProvider` | `OpenAICompatProvider` (self-hosted vLLM/TGI, in-country) |
+| | `AnthropicBatchProvider` (external) | `OpenAICompatProvider` (self-hosted vLLM/TGI, in-perimeter) |
 |---|---|---|
 | Structured output | tool-use / JSON-schema output with `enum` over service names (fallback §4.1) | guided decoding (xgrammar/outlines) with the **same** JSON Schema file |
 | Batch | native Batches API | none — the executor uses a local bounded worker pool |
@@ -1528,15 +1556,30 @@ The schema file is shared verbatim, which is what keeps the two providers honest
 self-hosted model cannot satisfy the schema, that surfaces as a validation failure rate, not
 as a subtly different output shape.
 
-**Residency gate — fail closed.** `configs/*.yaml` carries
-`residency_mode: strict | permissive` and `input.data_classification: synthetic | production`.
-The provider registry refuses to construct a non-domestic provider when
-`residency_mode == strict`, and `s12_egress_gate` refuses to release any payload to a
-non-domestic provider when `data_classification == production` unless
-`legal_clearance_ref` is set to a non-empty reference recorded in the manifest. The fixture
-ships as `synthetic` + `permissive`; **the default in `pipeline.default.yaml` is
-`strict` + `production`**, so the unsafe combination requires a deliberate edit that shows up
-in a diff.
+**The egress switch — fail closed.** `configs/*.yaml` carries two fields:
+
+```yaml
+external_llm: denied | allowed        # may ticket text reach a third-party API?
+input:
+  data_classification: synthetic | production
+  legal_clearance_ref: null           # a reference to the approval, recorded in the manifest
+```
+
+- The **provider registry refuses to construct an external provider** when
+  `external_llm == denied`. Not a warning, not a fallback — a hard error at config load, so
+  the failure is at second zero rather than after 3,000 rows have already been sent.
+- **`s12_egress_gate` refuses to release any payload** to an external provider when
+  `data_classification == production` unless `legal_clearance_ref` is non-empty, and the
+  reference is recorded in the manifest so that "who approved this and when" is answerable
+  from the artifact rather than from someone's memory.
+- The fixture ships `synthetic` + `allowed` — it is invented data (`data/raw/README.md`) and
+  raises no question. **`pipeline.default.yaml` ships `production` + `denied`.** The permissive
+  combination therefore requires a deliberate edit to a tracked file, which shows up in a diff
+  and in review.
+
+*(Renamed from `residency_mode: strict | permissive` in an earlier revision. `external_llm`
+says what the field actually controls and does not imply a claim about any particular legal
+regime; `strict`/`permissive` also read as a severity dial rather than the binary it is.)*
 
 ### 6.4 What a change costs — the invalidation matrix
 
@@ -1778,9 +1821,9 @@ That is a change of kind, not only of degree, and it cuts in two directions:
 |---|---|---|
 | Time to harm | hours — a leaked key is used | slow, often never observed |
 | Remediation | **rotate**, and the exposure ends | **none**. A name and a phone number cannot be re-issued |
-| Regulator | none directly | **152-FZ, and Art. 18 localisation tightened from 1 July 2025** (spec §2.9) |
+| Governance | an internal engineering concern | **externally accountable** — customer data, with obligations we do not get to define ourselves (D-3, D-6) |
 | Detection difficulty | statistically invisible here — [measured, cleaning §2.4] 0 of 81 URL secrets exceed the base64 entropy limit | tractable with regex + NER, but NER over-fires: [measured] 45% of English name-shaped matches are HTTP reason phrases |
-| Right response to a miss | rotate, move on | assess notification duty, delete, document |
+| Right response to a miss | rotate, move on | scope it, delete what we control, escalate to legal, close the class (§8.5) |
 
 So: **the entropy/secret tier is deleted and nothing replaces it. The zone model, the egress
 gate, the logging denylist and the retention rule all stay, because every one of them was
@@ -1799,8 +1842,8 @@ URL-borne tokens by construction, which is a free property, not a control we are
 
 | Zone | Contents | Location | Who reads it |
 |---|---|---|---|
-| **R — raw** | the production export, `s00`/`s10` outputs (normalised but **not** redacted) | encrypted volume on an in-country host, directory mode `0700`, dedicated OS user `dsbuild` | **2 named engineers**, by name in a file in the infra repo. Not a group, not a role that grows |
-| **I — interim** | `s11` onward: redacted text, LLM cache, review workbooks | same host, mode `0750`; object storage bucket `interim/` with in-country region | the ML team |
+| **R — raw** | the production export, `s00`/`s10` outputs (normalised but **not** redacted) | encrypted volume on a host inside the production perimeter, directory mode `0700`, dedicated OS user `dsbuild` | **2 named engineers**, by name in a file in the infra repo. Not a group, not a role that grows |
+| **I — interim** | `s11` onward: redacted text, LLM cache, review workbooks | same host, mode `0750`; object storage bucket `interim/`, same perimeter | the ML team |
 | **P — processed** | frozen corpus, manifests, run reports | object storage `corpus/`, object-lock | ML team + anyone reading a metrics claim |
 | **X — external** | the LLM provider | outside the perimeter | governed by §6.3 and §8.2 |
 
@@ -1815,15 +1858,21 @@ sees the text it has already seen the text" — with credentials as the vivid ex
 removes the vivid example. The gate stays, and here is the argument that actually carries it,
 which does not depend on secrets at all:
 
-> **152-FZ constrains the movement of personal data, not the movement of credentials.**
-> Sending a Russian customer's name, phone number and company ИНН to a foreign API is the
-> regulated act, and it is regulated whether or not an API key travelled with it. `s12` is
-> the one place in the pipeline where that act is prevented rather than audited afterwards,
-> because it sits **before** the first stage that can transmit anything (§6.3).
+> **The thing under control is customer personal data leaving our perimeter, and that is a
+> concern whether or not an API key travelled with it.** A customer's name, phone number and
+> company identifier reaching a third party is the event we are preventing; secrets were only
+> ever the most attention-grabbing passenger. `s12` is the one place in the pipeline where
+> that event is *prevented* rather than audited afterwards, because it sits **before** the
+> first stage that can transmit anything (§6.3).
 
-A second argument, weaker but real: personal data is un-revocable (the table above), so a
-control that prevents egress is worth disproportionately more than one that detects it. There
-is no rotation step to fall back on.
+Two supporting arguments, both independent of secrets:
+
+- **Un-revocability.** Personal data cannot be rotated (the table above), so a control that
+  blocks egress is worth disproportionately more than one that detects it after the fact.
+  There is no equivalent of "rotate the key and move on" to fall back on.
+- **We do not own the decision.** Whether this data may go to a third party is legal's call
+  and is unresolved (C8, D-3). A gate that fails closed is how an engineering design defers
+  to a decision it has not received yet, instead of quietly assuming an answer.
 
 Nothing crosses the Zone I → Zone X boundary until `s12` passes. It asserts, in order:
 
@@ -1844,7 +1893,8 @@ Nothing crosses the Zone I → Zone X boundary until `s12` passes. It asserts, i
    stages is how one of them quietly stops being enforced.
 4. Every row has a non-empty `redaction_rules_version` and a `ticketprep_version` matching the
    configured pin.
-5. Residency: §6.3's fail-closed check.
+5. **Egress permission**: §6.3's fail-closed check — `external_llm` and, for production data,
+   a non-empty `legal_clearance_ref`.
 6. **Canary recall** (cleaning §6.4): if the build was run with the canary corpus injected,
    recall must meet the configured floor. Reported with the caveat cleaning §6.4 requires —
    it is a regression test, not an assurance.
@@ -1873,19 +1923,18 @@ instinct is that it should.**
 
 The 30-day window had two justifications. One was *standing credential exposure* — every day
 the raw export sits there is another day a live key is readable by a process that has no need
-for it. **That justification is gone.** The other was *personal-data minimisation*: 152-FZ
-and general data-protection practice both push toward keeping identifiable data only as long
-as the purpose requires, and the purpose here (build a corpus) completes at freeze. That
-justification is untouched, and it was always the stronger of the two — it is the one that
-would survive a regulator's question, whereas "we were worried about API keys" is an internal
-engineering concern.
+for it. **That justification is gone.** The other is *data minimisation*: keep identifiable
+customer data only as long as the purpose requires, and the purpose here — building a corpus
+— completes at freeze. That justification is untouched, and it was always the stronger of the
+two. It is also the one that survives being asked about from outside engineering, whereas "we
+were worried about API keys" is an internal concern that nobody else has a stake in.
 
 There is also a countervailing argument that got *stronger*, and it points the same way:
 personal data cannot be rotated, so the marginal risk of each extra retention day never
 declines, whereas a credential's risk decays as it is rotated on its own schedule.
 
 So the answer is unchanged at **30 days**, but the reason recorded in D-6 changes from
-"limit credential exposure" to "personal-data minimisation, and irreversibility". That
+"limit credential exposure" to "data minimisation, and irreversibility". That
 matters because the next person to argue for 180 days will argue against the reason they
 find written down, and it should be the right one. What I would accept without much
 resistance: extending to **90 days for the first production build only**, on the grounds that
@@ -1939,9 +1988,10 @@ from the credential version, because there is nothing to rotate:
 2. **Delete what we control.** Purge the affected cache objects and any interim checkpoint
    carrying the text; request deletion at the provider under the applicable data-processing
    terms and record the request and its reference.
-3. **Escalate, do not self-assess.** Whether this is a reportable personal-data incident is a
-   DPO/legal determination with statutory clocks attached. Engineering's job is a complete,
-   timestamped scope report within hours, not a judgement call about severity. **This is the
+3. **Escalate, do not self-assess.** Whether this is a reportable incident is a legal/DPO
+   determination and not an engineering one, and it is likely to be time-sensitive.
+   Engineering's job is a complete, timestamped scope report within hours, not a judgement
+   call about severity. **This is the
    step that has no analogue in the credential playbook and it is the one most likely to be
    skipped by an engineer following muscle memory.**
 4. **Close the class, not the instance.** Add the missed span as a permanent canary
@@ -1969,7 +2019,7 @@ Collected; the reasoning is in the section named.
 | Cache key (§4.4) | rendered payload + prompt bundle + schema + model snapshot | keyed on `ticket_id` (misses identical text, breaks on re-export); keyed on source fields (misses `ticketprep` changes — the dangerous direction) |
 | Split rule (§3.5) | temporal + gap + cluster grouping + org-conditioned near-dup purge | strict org grouping — **measured to leave 0 test rows**; org-assigned-by-median-date — destroys "test is the most recent period", which is the entire reason for a temporal split |
 | Dedup input (§2.2) | Phase-1 normalised text | Phase-2 cleaned text — makes split boundaries a function of the prompt |
-| Review tool (§5.4) | generated XLSX round-trip | Argilla (right answer at ≥1,500 rows or recurring builds; overkill now), Label Studio, Doccano, Prodigy (closed source + per-seat), Google Sheets (residency, revision history) |
+| Review tool (§5.4) | generated XLSX round-trip | Argilla (right answer at ≥1,500 rows or recurring builds; overkill now), Label Studio, Doccano, Prodigy (closed source + per-seat), Google Sheets (ticket text in a third-party service, uncontrollable revision history) |
 | Blindness mechanism (§5.4) | two files; round-1 file does not contain the answer | hidden/protected columns in one file — a UI convention, not a guarantee |
 | Queue sizing (§5.4) | capacity-bounded + a mandatory random audit stratum | threshold-bounded — makes the schedule a function of a prompt, and never measures what the judge missed |
 | Artifact storage (§4.7) | object storage + hashes in a git manifest | DVC (see above), git-lfs (undeletable after a PII incident; taxes every TS clone) |
@@ -1983,7 +2033,7 @@ Collected; the reasoning is in the section named.
 | **Self-consistency (§6.2, §6.6)** | **escalating ≤3 votes** on the measured 288-row residual (~375–600 calls, $5.18) | 1 vote over the whole corpus (rev-1's answer — 9× the cost and a weaker instrument); **unconditional 3 votes** on the residual (864 calls, $7.78 — 288 of them on rows the first pass already cleared); N-of-M by temperature (rejected on current models, fallback §4.2) |
 | **Judge input sizing (§6.2)** | measured demand (288), with `judge.max_rows` = 1,500 as a **non-binding backstop** | a score threshold with no cap — makes a threshold tweak into an unbudgeted spend, the same failure the review capacity cap exists to prevent; sizing from my rev-2 1,400-row *estimate* — superseded by cleaning §4.3's measurement |
 | **Secret scanning in the data path (§8.2)** | **removed** (C10) | keeping `gitleaks`/`detect-secrets`/entropy "just in case" — [measured, cleaning §2.4] 0/81 URL tokens exceed the base64 entropy limit and 40% fall below the hex limit, so it neither works nor has a threat to work on. Retained **only** as a pre-commit guard on our own source tree (§8.5) |
-| **The egress gate after C10 (§8.2)** | kept, re-justified on 152-FZ and irreversibility, and made two-sided | deleting it along with the secret tier — the regulated act is moving *personal data*, and it is regulated whether or not a key travelled with it |
+| **The egress gate after C10 (§8.2)** | kept, re-justified on personal data and irreversibility, and made two-sided | deleting it along with the secret tier — the event under control is *customer personal data leaving the perimeter*, which is a concern whether or not a key travelled with it |
 
 ---
 
@@ -2011,7 +2061,7 @@ marked `frozen: false` until the gates are real".
 | **10** | `review/workbook.py` + `review/merge.py` (HMAC tokens, dropdowns, injection guard, two rounds, `flag_tiers` round-trip) | round 1 issued to 2 reviewers | 9 |
 | **11** | Human review round 1 + 2; `s50_merge_verdicts`; rebuild; **per-tier precision computed** | **a corpus with human provenance on the reviewed slice, and the first measurement of which tiers are worth keeping** | 10 + reviewer availability (D-5) |
 | **12** | `model_service` skeleton with the startup fingerprint assert + `POST /internal/preprocess` + the cross-process conformance CI job | **the skew seam is closed before any model ships**, not after | 4, 8 |
-| **13** | `OpenAICompatProvider` + a self-hosted model benchmark | the residency contingency is real rather than aspirational | 6, and legal's answer (D-3) |
+| **13** | `OpenAICompatProvider` + a self-hosted model benchmark | **the "no external LLM" contingency is real rather than aspirational** — built before we know whether we need it, because after we know is too late | 6; informed by, but not blocked on, D-3 |
 
 **Steps 1–5e are the strongest thing about the new shape and it deserves stating plainly:
 they have no LLM dependency at all, and they end with a complete label-quality report.**
@@ -2020,24 +2070,25 @@ Before the cascade, the LLM-free envelope stopped at step 5 — a corpus with cl
 splits and gates, but nothing said about whether the *labels* were any good. Now the envelope
 extends through tier 4, which means the project can answer "how much label noise is in this
 corpus, where is it concentrated, and which services are affected" **before spending a cent on
-an LLM, before writing a judge prompt, and before asking legal about residency**. Concretely,
-after step 5e and with no API key configured, we have: [measured] 71 provably-conflicting
-rows, a ranked mislabel list, a per-service label-quality profile, a kNN agreement
-distribution, and the UMAP taxonomy diagnostic that shows whether `auth` and `access-control`
-are separable at all. If that report says label noise is negligible, **Phase 3 may not be
-worth building** — and that is a finding worth reaching in week 2 for free rather than in
-week 5 for $32 and a prompt-engineering cycle.
+an LLM, before writing a judge prompt, and before legal has to answer whether ticket text may
+leave the perimeter at all**. Concretely, after step 5e and with no API key configured, we
+have: [measured] 71 provably-conflicting rows, a ranked mislabel list, a per-service
+label-quality profile, a kNN agreement distribution, and the UMAP taxonomy diagnostic that
+shows whether `auth` and `access-control` are separable at all. If that report says label
+noise is negligible, **Phase 3 may not be worth building** — and that is a finding worth
+reaching in week 2 for free rather than in week 5 for $25 and a prompt-engineering cycle.
 
 It also de-risks the two dependencies most likely to slip: the cleaning spec's judge prompt
-(D-1) and legal's residency answer (D-3). Neither blocks anything up to step 5e.
+(D-1) and legal's answer on sending ticket text to a third party (D-3). Neither blocks
+anything up to step 5e.
 
 **Rollout note for when this stops being a fixture.** The first production build must run
-steps 1–5e against a real export with `data_classification: production`, `residency_mode:
-strict`, and phases 2 and 3-tier-5 **disabled** — the cheap tiers are local and involve no
-egress, so they run freely — to validate the egress gate on real dirt before any text is
-eligible to leave the perimeter. Enable Phase 2 only after `s12` has passed on a full
+steps 1–5e against a real export with `data_classification: production`,
+`external_llm: denied`, and phases 2 and 3-tier-5 **disabled** — the cheap tiers are local and
+involve no egress, so they run freely — to validate the egress gate on real dirt before any
+text is eligible to leave the perimeter. Enable Phase 2 only after `s12` has passed on a full
 production export with zero residual hits and over-redaction within gate across at least two
-runs.
+runs, **and** D-3 has been answered.
 
 ---
 
@@ -2047,7 +2098,8 @@ runs.
 |---|---|---|---|
 | **D-1** | **The cascade's tier semantics are not yet written.** `dataset-pipeline-cleaning.md` now exists and covers Phases 1–2 and the judge, but the tier-1–4 criteria — conflict threshold, `t2_missing_threshold`, cleanlab parameters, `k` and the agreement metric, and which `flag_reasons` map to `route = human_direct` vs `llm_judge` — are the respecification in flight | ml-researcher | Write them against the schemas in §3.4. **Three of my constraints are runtime, not preference, and should not be re-litigated as ML choices**: the O(edits) Phase-2 schema and its ≤120/≤160 output-token budgets (§6.2); folds keyed on `dedup_cluster_id` (§4.5, F-17); and tiers emit scores + a reason, never a decision (§3.4) |
 | **D-2** | **Runbook §6's "group by `organization_id`" is not implementable with a temporal split** — measured: 100% of test rows share an org with train; a strict purge leaves 0 test rows (§3.5) | ml-researcher + product | Adopt §3.5's replacement (cluster grouping + org-conditioned near-dup purge at J≥0.50, costing 1.4% of test) and **amend runbook §6** so the next reader is not misled. Report `org_overlap_rate` and the seen-org/unseen-org metric split permanently |
-| **D-3** | **152-FZ: may redacted ticket text go to a hosted LLM API?** (spec §8 Q7, fallback §7) | Legal / DPO | Blocks step 7 of §10 for production data, not for the synthetic fixture. Default the config to `strict` and build step 13 in parallel so a "no" costs a week, not a redesign. **Do not start Phase 2 on a production export before this lands** |
+| **D-3** | **May pseudonymised ticket text go to a hosted LLM API?** Phase 1 removes direct identifiers, but the text is still customer-authored and the residual re-identification risk is not zero | Legal / DPO | Blocks step 7 for production data; **does not block anything on the synthetic fixture**, which is invented text. Config defaults to `external_llm: denied`, and step 13 is built in parallel so a "no" costs a week rather than a redesign. **Do not run Phase 2 on a production export before this lands.** Give legal the concrete artifact rather than the abstract question: a sample of post-`s12` redacted rows and the §8.2 gate criteria, so they are ruling on what would actually be sent |
+| **D-3b** | **Is a self-hosted model available inside the perimeter, on what hardware, and who operates it?** This is the fallback D-3 depends on | Infra | Needed only if D-3 is "no", but **scope it now** — an unavailable fallback turns a config change into a procurement cycle. Fallback-policy §3 shows the volume is undemanding; the open questions are host, ownership and on-call, not feasibility |
 | **D-4** | **"At most one LLM call per row" — one *attempt* or one *accepted response*, and is it per phase?** (§1.4c, §6.2) | user | **Two separate readings, both needed, and neither is a request to relax the constraint.** (a) *One accepted response*, 3 attempts max, `1.05 × rows` budget per run — one-attempt-only sends ~0.2–0.5% of rows [estimate] to the human queue for a formatting reason, wasting reviewer time on a machine problem. (b) **The constraint is scoped per phase.** It bounds Phase 2 at one call per row over all 5,013 rows. Phase 3's escalating self-consistency is **up to three accepted responses per judged row by design**, and that is a separate budget line — it covers a [measured] 288 rows, so ~576 calls over 4,622 labelled rows = **0.12 calls/labelled row**, an order of magnitude *under* the Phase-2 budget. Cleaning §4.3.9 reads it the same way |
 | **D-5** | **Reviewer capacity — a much smaller ask than the last revision claimed.** ~200 queue rows × 2.5 min ≈ **8 h**, ~**25 h** including the calibration pilot and per-phase validation, *additional* to the runbook §4.2 gold-set 70 h | Support lead | Both my earlier figures (12.5 h) and proposal §7.1's reconciliation (~44 h) are withdrawn; cleaning §4.3.11's measured tier-selection counts supersede them. **The binding input is no longer reviewer availability — it is the real base reject rate**, which is unknown until tiers 1–3 run on the production export (four minutes of CPU, no human, no LLM). Ask for a *provisional* 25 h and re-derive before committing; the realistic contaminated-column case is ~400–700 rows ≈ 17–29 h. The 600-row cap stays as a non-binding backstop |
 | **D-6** | **Raw-export retention: 30 days post-freeze** (§8.3) — **the answer is unchanged by C10 but the recorded reason changes** | Legal + DPO + ML | 30 days, justified by **personal-data minimisation and irreversibility**, not by credential exposure (which C10 removed). §8.3 shows the reasoning. I would accept 90 days for the *first* production build only, auto-expiring and recorded in the manifest, on the grounds that the first run is the one most likely to need raw re-derivation while detectors are still being tuned |
@@ -2055,6 +2107,6 @@ runs.
 | **D-8** | **`allow_unpartitioned_eval` for the fixture.** The fixture has no `ticket_messages`, so no label in it is verifiably human (§1.2) | ML | `true` for the fixture only, with `provenance_complete: false` banner-printed in every report. **Never** for a production build — that flag existing at all is a risk, and it should be `false` in `pipeline.default.yaml` |
 | **D-9** | Does the eventual real input arrive as a CSV export or a read-replica query? | Backend / DBA | Either works; a query needs `export_query_sha256` populated and the query text archived. **A live query with no snapshot is the one thing C2 forbids** |
 | **D-10** | Repo layout `py/` vs the brief's `pipeline/` (§1.4d) | user | `py/`. Cheap to change now, expensive after 200 imports exist |
-| **D-11** | **Tier-4 embedding checkpoint and its residency status.** Which checkpoint, pinned at which commit SHA, mirrored where? (§4.8) | ML + infra | `intfloat/multilingual-e5-small` (MIT, 118 MB INT8), pinned by commit SHA, mirrored in-country. **Inference must be local with no network access during `s45`** — the config deliberately has no field for a hosted embedding endpoint. Keep it decoupled from the production classifier checkpoint (§6.1): coupling them makes the label audit of a corpus depend on the model that corpus trained |
+| **D-11** | **Tier-4 embedding checkpoint.** Which checkpoint, pinned at which commit SHA, mirrored where? (§4.8) | ML + infra | `intfloat/multilingual-e5-small` (MIT, 118 MB INT8), pinned by commit SHA, served from an internal mirror. **Inference must be local with no network access during `s45`** — the config deliberately has no field for a hosted embedding endpoint. Keep it decoupled from the production classifier checkpoint (§6.1): coupling them makes the label audit of a corpus depend on the model that corpus trained |
 | **D-12** | **Determinism vs wall-clock on tiers 2–4.** Pinning `OMP_NUM_THREADS=1` costs ~3× on the embedding pass; not pinning it means `dataset_version` can change with no semantic change (§4.5, F-22) | ML + me | Pin for any build that will be frozen or cited; leave unpinned while iterating. Round `t2_probs` to 6 significant digits before ranking and hashing. This is a genuine new cost of putting fitted models in a previously bit-deterministic pipeline and it should be a conscious choice, not a surprise in CI |
 | **D-13** | **Does the cheap-tier report alone settle whether Phase 3 is worth building?** (§10, cleaning §4.3.12) | ML | Decide *after* step 5e and before step 9, on cleaning §4.3.12's measured rule (`P_cheap`, `Yield_judge`) rather than on taste. If it fires, **do not build the judge** — the cascade will have paid for itself by preventing work, and the corpus gains zero model-provenance labels from this pipeline (§3.6) |
