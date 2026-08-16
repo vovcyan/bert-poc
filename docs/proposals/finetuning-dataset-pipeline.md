@@ -69,7 +69,7 @@ cost. Reinstating the tier would be a version bump and a re-run, not a redesign.
 
 | Phase | What it does | LLM | Cost | Owner doc |
 |---|---|---|---|---|
-| **0 — ingest** | CSV → Arrow, canonicalise, snapshot hash | no | free | arch §3.1 |
+| **0 — ingest and profile** | CSV → Arrow, canonicalise, snapshot hash; then **label-imbalance profiling of the input** (§3.1) | no | **0.15 s** [measured] | arch §3.1, cleaning §4.0.1 |
 | **1 — deterministic** | Unicode/`ftfy` repair, whitespace and quote normalisation, `services`/`labels` hygiene, boilerplate and signature stripping, log-skeleton removal, PII → stable placeholders, language ID, length filters, **egress gate** | **no** | **0.09 ms/row** [measured] | cleaning §4.1 |
 | **2 — bounded LLM** | ≤1 accepted call/row: span classification, rule mining, row metadata, residual-PII second opinion. **Emits no prose** | 1/row | ~$19 [estimate] | cleaning §4.2 |
 | **3 — label audit** | A cascade of instruments, cheapest first (below) | residual only | small | cleaning §4.3 |
@@ -79,7 +79,58 @@ cost. Reinstating the tier would be a version bump and a re-run, not a redesign.
 class balance and gates are whole-corpus operations that cannot live in a per-row map, and the
 runbook already requires them (§4.3, §6).
 
-### 3.1 Phase 3 — the cascade
+### 3.1 Phase 0 — profiling the input, before anything is spent
+
+Class balance was previously computed only in Phase 4, on the **assembled corpus at the end of a
+build**. Profiling the **input** is a different question and a more urgent one: if a service has 15
+positives in the raw export, no amount of cleaning, judging or reviewing creates more, and the
+correct response is a scoping conversation rather than a pipeline run. It costs **0.15 s
+[measured]** and it gates ~$25 of LLM calls and ~28 person-hours.
+
+**The measurement that justifies the phase** — projected positives under the temporal 70/15/15
+split, which was computed nowhere before:
+
+| Service | corpus | train | val | **test** | Precision CI half-width at n |
+|---|---|---|---|---|---|
+| `managed-redis` | 98 | 67 | 13 | **18** | ±16.7pp |
+| `dns` | 41 | 31 | 5 | **5** | ±35.6pp |
+| `cdn` | 38 | 26 | 7 | **5** | ±35.6pp |
+| `message-queue` | 31 | 25 | 5 | **1** | ±48.8pp |
+| `terraform-provider` | 15 | 13 | 1 | **1** | ±48.8pp |
+
+Half-widths are Clopper–Pearson around a true precision of 0.90. They are what makes the parent
+spec's "50 positives" line actionable per service rather than a rule of thumb: **±9.2pp at n=50**,
+and a precision number on 1 positive is not a number.
+
+**Corpus-level counts hide this.** `message-queue` has 31 positives corpus-wide, which reads as
+merely thin, and **1** in test. Five of twenty services cannot be given a precision figure at all.
+
+**And you cannot annotate your way out of it.** Reaching 50 test positives at these prevalences
+needs **15,625 tickets for `terraform-provider`**, and 5,618–7,463 for the others, against a
+2,000-ticket gold budget. That arithmetic is the product owner's decision, not the ML team's.
+
+Two supporting findings from the same 0.15 s:
+
+- **The distribution summary is a trap.** Head:tail is **56.7 : 1**, but normalised entropy is
+  **0.915** and Gini **0.361** — which look healthy, because 15 services genuinely do sit between
+  271 and 851 positives. The damage is a *cliff* between `managed-redis` (98) and `dns` (41) that
+  any single scalar averages away. A gate built on entropy alone passes this corpus.
+- **Profile normalised, and report the raw delta.** The raw `services` column carries **59 distinct
+  tokens against a 20-service taxonomy** [measured] — leading spaces, mixed case, internal
+  duplicates. A report claiming 59 services is a bug, not a finding, and the cardinality histogram
+  the parent spec requires is simply *wrong* when computed raw. The raw-versus-normalised delta is
+  kept as its own table because on production a rising delta means something is writing
+  `tickets.services` without validation.
+
+Services are tiered by consequence rather than flagged: absent (0 positives) is a **hard stop** —
+it is a defect, meaning a stale taxonomy or a broken export; unevaluable (<30 projected test
+positives) is reported as "insufficient data" and excluded from macro metrics, which are then
+reported both ways; unlearnable (<50 training positives) is handed to rules or abstention;
+merge-candidate adds a confusable partner. **A thin tail warns rather than stops** — 15 positives
+is a fact about the world, and halting there would make the pipeline unusable on exactly the
+long-tail corpora it exists for.
+
+### 3.2 Phase 3 — the cascade
 
 All figures [measured] on the fixture.
 
@@ -231,7 +282,7 @@ handed off explicitly rather than deleted: the concrete ask is a 20-centroid tab
 classifier spec §9.1's artifact list, with the check moved into the model service, which already
 has that encoder loaded and needs one vector operation. **D-9 needs an owner assigned.**
 
-### 4.4 Getting the statistics right
+### 4.5 Getting the statistics right
 
 Three places where the obvious choice produces a number that means nothing:
 
@@ -253,7 +304,33 @@ Three places where the obvious choice produces a number that means nothing:
   `n_positives`, never averaged**. Note also that the α ≥ 0.67 gate is an *annotator* gate and
   does not transfer to judge-versus-stored comparisons.
 
-### 4.5 "59% of rows are ambiguous" became 71 rows
+### 4.6 What the imbalance implies — and what it does not
+
+The 56.7:1 ratio is **not automatically a defect to be corrected.** It may faithfully describe what
+customers write about, and flattening it would make the model worse calibrated for production. The
+failure mode is *unmeasured* imbalance — a model that silently never predicts the tail while micro
+metrics look fine. Three consequences follow, and none of them is a resampler.
+
+**Resampling is largely unavailable here, and the arithmetic is the argument.** This is
+multi-label, so rows carry several labels at once: oversampling `cdn` 10× adds 342 `cdn` positives
+**and 396 positives to other services** [measured] — more collateral than target, 11× of it landing
+on `dns`, itself a rare service. Undersampling the head deletes rows carrying everything the head
+co-occurs with. The recommendation is per-service loss weighting, which operates at the
+`(row, service)` cell — the granularity the problem actually has. Most imbalance folklore is
+written for multi-class and does not transfer.
+
+**Per-service thresholds are the main lever, and the circularity has to be named.** The services
+that most need a tuned τ_s are exactly the ones without enough validation positives to place one —
+`terraform-provider` projects **1** validation positive. Phase 0's real deliverable is therefore the
+list of services that must use pooled or shrunk thresholds, produced *before* tuning rather than
+discovered during it.
+
+**Macro-versus-micro is an imbalance consequence, not a separate topic.** The four sub-50 services
+carry 125 of 8,771 positives — 1.43%. So a model that **never predicts any of them** still reaches
+a **98.57% micro-recall ceiling against an 80.0% macro ceiling** [measured]. That 18.6pp gap is the
+entire argument for the parent spec's macro requirement, in one comparison.
+
+### 4.7 "59% of rows are ambiguous" became 71 rows
 
 The taxonomy's deliberate ambiguity (`auth`/`access-control`, `monitoring`/`logging`,
 `console-ui`/component) touches 59.1% of rows — 2,730 of them. Routing all of those to review
@@ -389,6 +466,7 @@ shrinks and the *handling* controls do not:
 | **D-3** | **Is a self-hosted LLM available in-perimeter, and at what tier?** | Infra | Needed only if D-1 is "no". The provider seam makes it a config change |
 | **D-4** | **"At most one LLM call per row" — one *attempt* or one *accepted response*, and is the budget scoped per phase?** | User | One accepted response, 3 attempts max; one-attempt-only routes ~0.2–0.5% of rows to a human for a *formatting* failure, spending reviewer time on a machine problem. And **scoped per phase**: the judge's escalating self-consistency is up to three accepted responses per judged row by design. The arithmetic makes the case better than the argument — ~576 calls over 4,622 labelled rows is **0.12 calls per labelled row**, an order of magnitude under the Phase-2 budget it would be compared against. This is a confirmation request, not a request to relax anything |
 | **D-5** | **Run tiers 1–3 on a real export in week 1** to get the true label-noise rate | ML | Do it first. Four minutes of CPU, no LLM, no human, no approval — and it sizes everything downstream, including whether Phase 3's LLM tier is worth building |
+| **D-5b** | **Scoping the four sub-50 services** — `dns`, `cdn`, `message-queue`, `terraform-provider` | Product owner | Decide in week 1, from the Phase-0 profile. The options are: accept them as report-only and exclude from macro, handle by rules or abstention, merge a confusable pair, or fund a longer window / enriched sampling. **Annotating is not on the list** — 50 test positives for `terraform-provider` needs 15,625 tickets. Waiting does not help either; two of the four have a zero quarter |
 | **D-6** | **Human budget: ~28 person-hours (~12 h queue), in addition to the ~70 h gold set** | Support lead | Confirm. **If only 70 h exist in total, spend all of it on the gold set and drop Phase 3.** Do not fund the queue out of the gold budget. The queue size is a deliberate trade (§4.4) and should be re-settled against the real export's flag rate rather than the fixture's |
 | **D-7** | **Amend runbook §6** — org-grouped temporal splitting is infeasible (§7.1) | ML + product | Adopt the measured replacement and edit the runbook |
 | **D-8** | **Who authors the `auth` vs `access-control` tie-break rules?** | Product owner | Without written rules, judge and reviewer disagree on the same rows forever. This is the taxonomy's largest error source |
@@ -414,6 +492,7 @@ label-quality report.**
 | Step | Deliverable | Blocked by |
 |---|---|---|
 | 1–2 | Repo skeleton, `make` DAG, ingest, run report | — |
+| **2b** | **Label-imbalance profile of the input** (§3.1) | — |
 | 3–4 | `ticketprep` package: normalise + redact + egress gate, golden test file | — |
 | 5a–d | Dedup, split, assemble, gates, freeze — wired straight from Phase 1 | — |
 | **5e** | **Conflict detection, TF-IDF baseline, confident learning, taxonomy reports** | — |
@@ -422,6 +501,11 @@ label-quality report.**
 | 9–11 | Judge on the residual, queue, XLSX round-trip, human review | D-6, D-8 |
 | 12 | Model-service startup fingerprint assert + cross-process conformance CI | — |
 | 13 | Self-hosted provider + benchmark | D-3 |
+
+**Step 2b is the earliest point at which the project can learn something that changes its scope**,
+and it is a day-one deliverable: it is a pure function of the input and the taxonomy, with no seed,
+no model and no network, so it runs against a production export on a laptop before anyone decides
+whether to build the rest.
 
 **Step 5e is the milestone that matters.** Previously the LLM-free envelope stopped at clean text
 and splits, saying nothing about label quality. Now it answers *how much noise, where, and in which

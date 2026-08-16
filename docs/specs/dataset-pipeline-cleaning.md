@@ -2,7 +2,7 @@
 
 Status: specification (not implemented)
 Author: ml-researcher
-Date: 2026-08-16 (revision 4)
+Date: 2026-08-16 (revision 5)
 Input: [`data/raw/tickets_export.csv`](../../data/raw/tickets_export.csv) (5,013 rows)
 Output: a versioned training corpus for the multi-label ticket→services classifier
 
@@ -29,6 +29,14 @@ Output: a versioned training corpus for the multi-label ticket→services classi
    effort goes into **widening the tier-3 selector** (§4.3.11), and the UMAP deliverable is
    replaced by two free tables in §6.1. Gate **G18** now governs admission of any future
    row-selection tier. Queue: **~285 rows / ~28 h**.
+5. **(r5) Phase 0 — ingest and profile added** (§4.0.1). A label-imbalance profile of the **input
+   CSV**, computed in seconds before Phase 1 runs, because §6.1's class balance lands on the
+   assembled corpus at the *end* of the build and the decision it informs is a scoping one. It
+   reports per-service counts, prevalence, imbalance ratio, entropy/Gini, cardinality, and counts
+   **projected per split** — [measured] `terraform-provider` and `message-queue` project to **one
+   test positive each**, so 5 of 20 services cannot be given a precision number. Four T-tiers with
+   consequences, gates **G19–G21**, and §4.0.1.4 on what imbalance does and does not imply for
+   multi-label training.
 
 **Companion documents — read these first, this one sits under them:**
 
@@ -472,12 +480,239 @@ Tier assignments at a glance:
 | Log/traceback skeleton reduction | A |
 | Input template assembly, truncation | A |
 | NER-based `<PERSON>` / `<ORG>` redaction | A **only if** the budget in §4.1.5 is met; otherwise B |
+| **Phase 0 label profiling (§4.0.1)** | **B** — reads labels, changes nothing |
 | `services` / `labels` / `flags` canonicalisation | B (labels, not text) |
 | Language identification and code-switch tagging | B |
 | Near-duplicate clustering | B |
 | Length/emptiness/quality filters and quarantine | B |
 | **Phase 2 (LLM), all of it** | **B** |
 | **Phase 3 (judge + human queue), all of it** | **B** |
+
+---
+
+### 4.0.1 Phase 0 — ingest and profile
+
+**Placement, and why it is numbered 0.** This runs immediately after CSV ingest and **before
+Phase 1 touches a single character**. It is numbered 0 rather than inserted as a new Phase 1 so
+that the existing phase numbers — referenced from the architecture document, the proposal, the
+runbook and the classifier spec — stay valid. The architect owns the stage mechanics; this
+section owns what is computed and what it means.
+
+**Why it cannot wait for §6.1.** §6.1 already reports class balance, and classifier spec §2.8
+already requires per-service positive counts — but **both land on the assembled corpus, at the
+end of the build.** The question Phase 0 answers is about the *input*, and the distinction
+decides money: **if a service has 15 positives in the raw export, no amount of cleaning, judging
+or reviewing creates more.** The correct response to that finding is a scoping conversation with
+the product owner, not a pipeline run. It costs seconds of pandas and it must arrive before
+anyone commits ~$25 of LLM calls and ~28 person-hours (§4.3.11). Phase 0 exists because the
+cheapest possible answer to "is this dataset viable?" was being computed last.
+
+#### 4.0.1.1 What is computed
+
+All of it from `services`, `created_at` and the text — no model, no cleaning, no dependencies
+beyond the dataframe library. Every figure carries `n`.
+
+| # | Statistic | Purpose |
+|---|---|---|
+| 1 | **Per-service positive count, prevalence (% of labelled rows), and share of all positives** | The headline table. Prevalence and share differ because rows are multi-label; report both |
+| 2 | **Imbalance ratio** head:tail, and **mean / median** positives per service | One number a stakeholder can hold |
+| 3 | **Distributional summary**: normalised Shannon entropy and Gini over the label marginal | Ratio alone is driven by two services; these describe the whole shape and are diffable |
+| 4 | **Cardinality histogram** `|S| ∈ {0,1,2,3,4}` and any `|S| > 4` violations | Validates the `1 ≤ |S| ≤ 4` output contract against reality |
+| 5 | **Empty-`services` rate** | The untriaged/unactionable population (§4.1.10); it is not an error but it changes every denominator |
+| 6 | **Co-occurrence matrix** | Already specified as a §6.1 output — Phase 0 computes it first and §6.1 references it. **Do not duplicate the definition** |
+| 7 | **Per-service counts by temporal window** (month and quarter), with min/max ratio | A service that appears in one quarter and vanishes is a taxonomy change nobody recorded, or a product that shipped |
+| 8 | **Per-service counts by language** | Classifier spec §6.3 makes RU/EN a first-class slice with a hard ship gate; a service that is 95% one language cannot pass a per-language gate |
+| 9 | **Projected positives per split**, under the actual temporal 70/15/15 split (classifier spec §2.6), **and** under the planned 2,000-row gold test draw | **The single most decision-relevant number in the report**, and it is computed nowhere else |
+
+#### 4.0.1.2 The fixture's numbers [measured]
+
+Reported here in the form the artifact should take, so the implementation has a target.
+
+**Headline:** 5,013 rows · **4,622 labelled (92.2%)** · 391 empty (7.80%) · 8,771 positives ·
+20 services · mean cardinality **1.90** · imbalance **56.7 : 1** (`billing` 851 →
+`terraform-provider` 15) · normalised entropy **0.915** · Gini **0.361** · mean 438.6 and median
+447 positives per service.
+
+| Service | n | Prevalence | Share of positives | train | val | **test** | EN share |
+|---|---|---|---|---|---|---|---|
+| `billing` | 851 | 18.41% | 9.70% | 615 | 129 | 107 | 26.5% |
+| `console-ui` | 793 | 17.16% | 9.04% | 591 | 106 | 96 | 28.2% |
+| `auth` | 762 | 16.49% | 8.69% | 573 | 92 | 97 | 27.4% |
+| `api-gateway` | 751 | 16.25% | 8.56% | 567 | 88 | 96 | 29.7% |
+| `compute` | 715 | 15.47% | 8.15% | 458 | 107 | 150 | 29.5% |
+| `access-control` | 667 | 14.43% | 7.60% | 468 | 106 | 93 | 26.2% |
+| `object-storage` | 645 | 13.95% | 7.35% | 470 | 96 | 79 | 28.1% |
+| `monitoring` | 590 | 12.77% | 6.73% | 419 | 90 | 81 | 38.8% |
+| `subscriptions` | 560 | 12.12% | 6.38% | 406 | 79 | 75 | 28.6% |
+| `networking` | 452 | 9.78% | 5.15% | 264 | 71 | 117 | 32.7% |
+| `notifications` | 442 | 9.56% | 5.04% | 305 | 84 | 53 | 26.9% |
+| `managed-postgres` | 404 | 8.74% | 4.61% | 244 | 84 | 76 | 34.2% |
+| `logging` | 324 | 7.01% | 3.69% | 227 | 55 | 42 | 23.8% |
+| `integrations` | 321 | 6.95% | 3.66% | 234 | 46 | 41 | 30.2% |
+| `backups` | 271 | 5.86% | 3.09% | 183 | 38 | 50 | 31.7% |
+| `managed-redis` | 98 | 2.12% | 1.12% | 67 | 13 | **18** | 25.5% |
+| `dns` | 41 | 0.89% | 0.47% | 31 | 5 | **5** | 29.3% |
+| `cdn` | 38 | 0.82% | 0.43% | 26 | 7 | **5** | 23.7% |
+| `message-queue` | 31 | 0.67% | 0.35% | 25 | 5 | **1** | 22.6% |
+| `terraform-provider` | 15 | 0.32% | 0.17% | 13 | 1 | **1** | 20.0% |
+
+Cardinality: `|S|=0` 391 (7.80%) · 1 → 1,569 (31.30%) · 2 → 1,988 (39.66%) · 3 → 1,034 (20.63%) ·
+4 → 31 (0.62%) · **>4 → 0**.
+
+**Read the bolded test column, because it is the finding.** `terraform-provider` and
+`message-queue` project to **one test positive each**; `dns` and `cdn` to five. A precision
+estimate on one positive is not an estimate — [computed] the Clopper–Pearson 95% interval around
+a true precision of 0.90 is **±48.8pp at n=1, ±35.6pp at n=5, ±22.1pp at n=10, ±16.7pp at n=18,
+±12.2pp at n=30 and ±9.2pp at n=50.** That is where classifier spec §2.8's "50 positives" line
+comes from, and Phase 0 is what makes it actionable per service instead of corpus-wide.
+
+**And the arithmetic that closes the door**, because it is the argument the product owner needs:
+to obtain 50 test positives at the fixture's prevalence you would need a test set of
+[computed] **15,625 tickets for `terraform-provider`**, 7,463 for `message-queue`, 6,098 for
+`cdn`, 5,618 for `dns` and 2,358 for `managed-redis` — against a gold test budget of **2,000**
+(runbook §4.2). Only `managed-redis` is within a factor of ~1.2 of reach. **You cannot annotate
+your way to an evaluable rare tail at this prevalence**; the options are a longer collection
+window, targeted enrichment sampling for those services alone (which then needs its own
+reweighting, and cannot be the main test set — runbook §0), or accepting that these services are
+reported without a number.
+
+Temporal instability in the tail is real and worth its own line [measured, positives per quarter,
+first and last quarters partial]: `cdn` ranges 1→14 across quarters (14×), `message-queue`
+2→18 with **a quarter at zero**, `terraform-provider` 5→0→1 with **a quarter at zero**. Head
+services move by 4.5–5.8×. A tail service with a zero quarter cannot support the monthly drift
+slice classifier spec §6.3 requires.
+
+#### 4.0.1.3 Tiers, and what each one triggers
+
+Classifier spec §2.8 draws one line at 50 positives. Phase 0 turns it into four tiers with
+consequences attached. Thresholds are on **human-labelled positives in the training pool**, with
+the projected test count as the second, independent test.
+
+| Tier | Condition | Consequence |
+|---|---|---|
+| **T-0 — absent** | **0 positives** in the export while present in `labels.json` | **Hard stop, G19.** The service is in the label space and unlearnable. Either the export is incomplete or the taxonomy contains something the product does not use. Not a modelling problem |
+| **T-1 — unevaluable** | **< 30 projected test positives** | Ship the head row in the label space, but **report "insufficient data" instead of a precision figure** (classifier spec §4.8 already requires this) and **exclude from macro aggregates**, reporting macro both ways. At ±16.7pp (n=18) the number would mislead more than it informs. [measured] this is `managed-redis`, `dns`, `cdn`, `message-queue`, `terraform-provider` — 5 of 20 services |
+| **T-2 — unlearnable** | **< 50 training positives** | The threshold-tuning path is not available (§4.0.1.4). Serve via the keyword rule or kNN-over-embeddings mechanism in classifier spec §4.8, or let the model abstain. **Do not let it silently take a τ_s of 1.0 without the report saying so.** [measured] `terraform-provider` (13), `message-queue` (25), `cdn` (26) |
+| **T-3 — merge candidate** | T-2 **and** the §6.1 pair-confusion table shows a co-occurring or confusable partner | Escalate to the product owner as a **taxonomy question**, not a modelling one. [measured] `cdn` co-occurs with `object-storage` 16× and `dns` 11× of its 38 rows; `dns` with `networking` 16×. Whether `cdn` should exist separately from `object-storage`/`networking` at this volume is a product decision and Phase 0's job is to put it in front of someone |
+
+**A service may be in more than one tier**; report the highest that applies. **No tier action is
+automatic** — every one of them is a recommendation to a human, in keeping with §4.3.1's rule
+that this pipeline routes and does not decide.
+
+#### 4.0.1.4 What imbalance actually implies for training
+
+Most imbalance folklore is written for multi-class problems and **transfers badly to multi-label
+ones**. Four consequences, argued rather than listed, because the wrong reflex here is expensive.
+
+**1. Resampling is largely unavailable, and this is the first thing someone will reach for.**
+In multi-class, oversampling a rare class touches only that class. Here every row carries a
+*set*, so **duplicating a row to raise one service's prevalence raises the prevalence of every
+other service on that row.** [measured] the fixture makes this vivid: `cdn`'s 38 rows have mean
+cardinality 2.16, so oversampling `cdn` 10× adds 342 `cdn` positives and **396 positives to
+other services** — more collateral than target — of which 11× go to `dns`, itself a rare service
+whose prevalence you were not trying to change. `terraform-provider` at 10× adds 135 target and
+117 collateral, mostly to `managed-postgres` and `object-storage`. Undersampling the head is
+worse: to thin `billing` you delete rows that carry `subscriptions`, `console-ui` and everything
+else they co-occur with. **Recommendation: do not resample. Use per-service loss weighting
+instead** — it applies at the level of the (row, service) cell, which is the granularity the
+problem actually has. Multi-label resampling methods that operate on label *sets* exist, but they
+change the joint label distribution the model is trying to learn, and this corpus has structured
+co-occurrence (§2.8) worth preserving.
+
+**2. Per-service thresholds are the main imbalance lever, and they are already the main precision
+lever — but the circularity has to be named.** Classifier spec §4.6.1 and §6.1 already tune τ_s
+per service to a precision floor. That machinery *is* the imbalance response: a rare service does
+not need a rebalanced training set so much as a threshold placed on enough validation positives
+to be placeable. **The problem is that the services that most need a tuned threshold are exactly
+the ones without enough validation positives to tune one.** [measured] `terraform-provider`
+projects **1** validation positive, `dns`, `cdn` and `message-queue` **5** each. A threshold swept
+on 5 positives is fitted to noise and will not hold on test — which is classifier spec §7 risk 13
+exactly. The mitigations, in order: **pooled or shrunk thresholds** for services below ~50
+validation positives (runbook §4.2 already proposes this, and Phase 0 is what identifies *which*
+services need it); a single tier-level threshold shared across all T-1 services; or τ_s = 1.0
+with the abstention recorded (classifier spec §6.1 step 3). **Phase 0's deliverable here is the
+list of services that must not get an individually-tuned threshold**, produced before threshold
+tuning runs rather than discovered during it.
+
+**3. Loss: recommend class-weighted BCE, switch on a measured condition.** Three candidates, and
+the project already carries the citation for the third:
+
+| Option | When it is right | Verdict |
+|---|---|---|
+| **BCE with per-service `pos_weight`** | The default. Directly counteracts the positive/negative asymmetry per output, costs nothing, one hyperparameter per service already in classifier spec §5.2's grid (`{1, sqrt(neg/pos), neg/pos}`) | **Recommended starting point.** At `terraform-provider`'s ratio the full `neg/pos` weight is ~307:1, which will destabilise training — **cap the weight** (start at 20–50) and search the cap |
+| **Focal loss** | Many easy negatives dominating the gradient | Not recommended first. It down-weights easy negatives, which is the same job `pos_weight` does more directly and more interpretably here, and it adds γ to the search |
+| **Asymmetric Loss** ([Ridnik et al., ICCV 2021](https://arxiv.org/abs/2009.14119)) | Designed precisely for multi-label with few positives per sample — here 1–4 of 20 — and it hard-thresholds very-easy negatives and discards probable mislabels | **The challenger, and it should be run.** Classifier spec §5.1 already specifies it as an ablation with `γ⁻ ∈ {2,3,4}`, `γ⁺ = 0`, `m ∈ {0.05, 0.1}`. Its mislabel tolerance is a bonus given §4.3.3's finding that flagged rows are hard rather than wrong |
+
+**Switch condition, stated so it is decidable:** run weighted BCE and ASL on the same seeds and
+splits. **Choose ASL if it improves validation macro-AP by ≥ 1.0pp with non-overlapping seed
+spreads; otherwise keep BCE**, because BCE has one fewer moving part and its `pos_weight` is
+directly interpretable from the Phase-0 table. Do not choose on principle — classifier spec §5.1
+already says this and it is worth repeating where the imbalance numbers live.
+
+**4. Macro versus micro is an imbalance consequence, not a separate topic.** The causal chain is
+short and should be stated once, here, where the numbers are: micro metrics pool every
+(row, service) decision, so they are dominated by whichever services have the most positives;
+[measured] the head 5 services carry **44.1%** of all positives and the head 9 carry **72.2%**.
+The four services under the 50-positive line carry **125 positives of 8,771 — 1.43%.** So a model
+that **never predicts any of them at all** still reaches a micro-recall ceiling of **98.57%**,
+while its macro-recall ceiling is **80.0%**. That 18.6pp gap is the entire imbalance story in one
+comparison, and it is why classifier spec §6.2 makes macro-AP the model-selection metric and §7
+risk 7 names the degenerate head-only solution. **Phase 0's contribution is to compute that gap
+before training, so the size of the blind spot is known rather than discovered.**
+
+#### 4.0.1.5 What imbalance is *not*
+
+**A 57:1 ratio is not automatically a defect to be corrected.** It may faithfully describe what
+customers write about: a platform whose users file 851 billing tickets and 15
+Terraform-provider tickets has a real, correctly-measured usage distribution, and forcing the
+training distribution to be uniform would make the model *worse* calibrated for production, where
+the head is genuinely what arrives. Classifier spec §1.2 is precision-first precisely because the
+product tolerates a missing suggestion better than a wrong one, and abstaining on a service you
+see twenty times a year is a defensible product behaviour.
+
+**The failure mode is not imbalance. It is *unmeasured* imbalance** — a model that silently
+never predicts the tail while micro-F1 reads 0.93 and nobody notices, because no per-service
+table with `n` beside it was ever produced. Everything in this section exists to make the
+distribution visible and to attach a decision to each tier, not to flatten it.
+
+Two corollaries worth stating so the report is not misread:
+
+- **Do not "fix" the ratio.** Fix the *evaluation* (report macro, report per-service `n`, report
+  "insufficient data" honestly) and fix the *scope* (merge or descope services the corpus cannot
+  support). Those are the two available levers and neither is a resampler.
+- **A prevalence that moves between exports is a finding regardless of direction.** A service
+  whose prevalence changes 3× between snapshots is either a product change, a taxonomy change, or
+  a broken export. That is why §4.0.1.6 requires the diff.
+
+#### 4.0.1.6 Presentation — the statistics must be *shown*
+
+The report is a human-facing artifact, not a JSON blob nobody opens. Requirements:
+
+- **`label_profile.md`** — rendered, committed with the snapshot, and **linked from the snapshot
+  manifest**. `label_profile.json` carries the same content machine-readably for the gates.
+- **One-line summary first, before any table.** Template:
+  > *"4,622 of 5,013 rows labelled (92.2%); 8,771 positives over 20 services; imbalance 56.7:1;
+  > **5 of 20 services project fewer than 30 test positives and cannot be given a precision
+  > number**; 0 services absent."*
+
+  The bolded clause is the sentence the reader is meant to act on. If nothing else is read, that
+  is the finding.
+- **Table 1 — per service, sorted by count descending**, columns exactly as §4.0.1.2, with the
+  tier (T-0…T-3) in the final column and the sub-50 test cells visually marked. Descending order,
+  not alphabetical: the reader's eye should fall off the bottom of the table into the tail, which
+  is where the decisions are.
+- **Table 2 — cardinality histogram** including `|S| = 0` and any `> 4` violations.
+- **Table 3 — per-service × quarter**, with min, max and the max/min ratio, so a zero window is
+  visible as a zero.
+- **Table 4 — per-service × language**, with the EN share, flagging any service whose minority
+  language falls below the count needed for the classifier spec §6.6 per-language ship gate.
+- **Table 5 — co-occurrence**, by reference to the §6.1 matrix, not recomputed.
+- **A diff against the previous snapshot** on every table, in the same style as the §6.1 taxonomy
+  reports: per-service count delta, prevalence delta, and tier transitions. **A tier transition is
+  the headline of any subsequent run** — a service crossing from T-1 into evaluability is good
+  news that should be reported as loudly as a service falling out of it.
+- **No plot is required.** Twenty rows sorted descending is more legible than a bar chart and it
+  diffs; §4.3.4 is the standing precedent for preferring a diffable table to a picture.
 
 ---
 
@@ -1992,6 +2227,7 @@ I state the inputs; `dataset-pipeline-architecture.md` owns the cost model and t
 | MinHash, 2 signatures | **2.1 ms/row/signature** [measured] | 21 s | 3.5 min |
 | Language ID | ~1 ms/row [estimate] | 5 s | 50 s |
 | Phase 2 | 1 call/row, ~1,900 in / ~200 out, cacheable prefix | ~$19 [estimate] | ~$190 [estimate] |
+| **Phase 0** — label profile (§4.0.1) | pure dataframe aggregation; **0.15 s** [measured] for the counts, split projection and per-quarter breakdown, plus ~5 s if the language tag is computed here rather than reused from §4.1.8 | **< 6 s** | < 60 s |
 | **P3 tier 1** — conflict grading over dup clusters | reuses §4.1.7 clusters; O(n) grouping | **< 5 s** [measured] | ~1 min |
 | **P3 tier 2** — TF-IDF + OvR LR, 5-fold `GroupKFold`, 20 services | **113 s** [measured], single machine, no GPU | **113 s** | ~25 min [estimate, superlinear in vocabulary] |
 | **P3 tier 3** — cleanlab 2.9.0 over `(N, 20)` probabilities | seconds | **< 10 s** [measured] | < 2 min |
@@ -2015,6 +2251,14 @@ side effect.
 
 Emitted as `pipeline_report.json` and rendered as a table in the model card. No snapshot is
 usable without it.
+
+**Phase 0 (§4.0.1)** — the label profile, in full, as the *first* section of the report. It is
+reproduced rather than referenced because it is the section a stakeholder reads: the one-line
+summary, Tables 1–5, the T-tier assignment per service, and the diff against the previous
+snapshot. §6.1's later class-balance figures are computed on the **assembled** corpus and must be
+reported **beside** the Phase-0 input figures, never instead of them — the delta between the two
+is exactly how much of the tail the pipeline itself removed, and a phase that quietly costs
+`cdn` 8 of its 38 positives is something the build must surface.
 
 **Phase 1**
 
@@ -2161,6 +2405,9 @@ snapshot is not written, and the run is reported.
 | **G16** | Tier-3 flags on services with < 50 positives | **0 auto-applied** | Route to a human (R2). Eroding a rare service below evaluability is unrecoverable and invisible to every aggregate metric |
 | **G17** | ΔB (label-noise delta, §4.3.3) | **report, do not gate** | [measured] it is **−0.79pp macro-AP** on this fixture, i.e. removing flagged rows *hurts*. A negative ΔB is a finding, not a failure — it says the flags are hard-but-correct rows and that auto-dropping must stay off (§4.3.1) |
 | **G18** | **Admission gate for any new row-selection tier** — including any future re-proposal of an embedding tier (§4.3.4) | On a labelled error set (injected or human-adjudicated): **`tier-3 top-N ∪ new-tier top-M` must beat `tier-3 top-(N+M)` on error recall, mean over ≥ 3 seeds, with non-overlapping spreads.** Report the ablation control too: dropping the new tier's *unique* flags from training must cost materially more macro-AP than dropping the same number of random rows | Do not admit the tier. [measured] the embedding kNN fails this by **5.5–9.4pp** and its ablation is indistinguishable from random (−0.42pp vs −0.28pp control). **"Corroborating only" does not exempt a tier from this gate** — it is the same gate with the cost moved into reviewer sort order on a capped queue |
+| **G19** | **Phase 0: a service in `labels.json` with zero positives in the export** | **exactly 0 such services** | **Hard stop before Phase 1 runs.** The service occupies an index in the label space and cannot be learned, so every macro metric silently averages in a class that can only score 0. It is not a modelling problem: either the export is incomplete (wrong window, wrong filter, a join that dropped rows) or the taxonomy contains a service the product does not use. Requires a human answer — a mapping-table entry (classifier spec §4.8) or a corrected export — before the build continues. [measured] 0 on this fixture |
+| **G20** | **Phase 0: projected test positives per service** (§4.0.1.2) | **warn and report** at < 30; **the report must name every service below the line in its one-line summary** | Do not stop the build — a thin tail is a legitimate corpus property, not a defect (§4.0.1.5). But the services below 30 must be marked T-1, excluded from macro aggregates (with macro reported both ways), and given "insufficient data" rather than a precision figure. **Silently reporting a precision computed on 1 positive is the failure this gate exists to prevent** — [computed] its 95% interval is ±48.8pp. [measured] 5 of 20 services fail this on the fixture |
+| **G21** | **Phase 0: prevalence drift against the previous snapshot** | **warn** at any service whose prevalence moves by ≥ 3×, or any T-tier transition | Investigate before training. Three causes and all matter: a product change (legitimate, retrain), a taxonomy change nobody recorded (invalidates historical labels — classifier spec §4.8 requires a mapping table), or a broken export (stop). Not a stop by itself, because the first cause is normal; a stop if the same service also fails G19 |
 
 ### 6.3 Egress gate on the finished corpus
 
@@ -2302,6 +2549,17 @@ reconstructed from this CSV.** That has consequences that no amount of text proc
   both numbers should be several times larger. **Every queue and person-hour figure in §4.3.11
   must be re-derived on the real export before any budget is committed** — it costs four minutes
   of CPU (P10).
+- **Phase 0 confirms a known-bad number here; it does not discover one.** The fixture's imbalance
+  is **deliberate**: per [`data/raw/README.md`](../../data/raw/README.md), "the rare tail is
+  deliberately NOT scaled proportionally … Instead: terraform-provider 15, message-queue 31, cdn
+  38, dns 41 — four services below 50 absolute positives … held down by weighting, not by lack of
+  scenarios (7–19 distinct scenarios each)." The tail was constructed so that "services that
+  cannot be learned or evaluated reliably" is a live property to design against. **So the §4.0.1
+  report reproduces a designed-in result, and it must not be presented as a finding.** Its real
+  value is the *first run against a production export*, where the numbers are unknown and the
+  scoping decision is live. What the fixture run does prove is that the report, the tiers and the
+  gates behave correctly on a corpus whose answer is known in advance — which is the right thing
+  to test them on.
 - **Dedup thresholds tuned here will be wrong on real data.** [measured] the corpus is
   compositional: 149 sentence types cover 48.2% of sentence instances, and TTR is 0.047–0.054.
   Lexical statistics are systematically lower than a real corpus of this size. The Jaccard 0.80
@@ -2347,6 +2605,8 @@ corpus being real.
 | 17 | **Model/library version drift in the cascade** | A cleanlab or scikit-learn upgrade changes which rows were flagged, so a snapshot cannot be reproduced and a past human review cannot be re-derived | `cleanlab_version` and `tier2_run_id` in the snapshot manifest (§5.1); pinned versions (§9.3) |
 | 18 | **A selection instrument enters on plausibility rather than on measurement** | It consumes reviewer slots or sort position, looks reasonable in review, and quietly lowers the recall per reviewer-hour. This already happened once: the embedding tier was specified with thresholds derived from a proxy that [measured] shares only 34% of its list with the real instrument | **Gate G18** — matched-budget recall against tier 3 plus the random-drop ablation control, before admission. The precedent and the full working are in [`knn-tier-validation.md`](./knn-tier-validation.md) |
 | 19 | **A requirement disappears with the stage that incidentally provided it** | The OOD detector for llm-fallback-policy §2 case 4 was riding on tier 4's embedding distances; cutting the tier silently removes it and nobody notices until the fallback path misbehaves | **P13 tracks it as an explicit hand-off to the classifier spec, not a deletion.** The general rule: when a stage is cut, enumerate what else was consuming its outputs before the deletion lands |
+| 20 | **Unmeasured imbalance** — the model never predicts the tail and micro metrics look healthy | [measured] the 4 sub-50 services carry 1.43% of positives, so never predicting any of them still leaves a **98.57% micro-recall ceiling against an 80.0% macro ceiling**. Micro-F1 would read fine while 20% of the taxonomy is dead | The Phase-0 report (§4.0.1) makes the size of the blind spot known *before* training; macro-AP as the selection metric (classifier spec §6.2); per-service prediction counts; G20 |
+| 21 | **Someone resamples to "fix" the imbalance** | Rare-service prevalence rises as intended and the co-occurring services' prevalence rises with it; the joint label distribution is quietly distorted and calibration degrades where it matters | §4.0.1.4 forbids it with the arithmetic: [measured] oversampling `cdn` 10× adds 342 target positives and **396 collateral**. Detection: compare the label marginal and co-occurrence matrix of the *training sample* against the Phase-0 profile — any divergence that is not an explicit weighting decision is this bug |
 
 ---
 
@@ -2368,6 +2628,8 @@ corpus being real.
 | **P11** | **Does the LLM judge survive its own decision rule (§4.3.12)?** | Measurement, after the 100-verdict pilot | If `P_cheap ≥ 0.80` and `Yield_judge < 0.10`, drop tier 5 entirely: the corpus then contains **zero** model-provenance labels from this pipeline, which is a materially better position for every future model generation. Do not skip this test to save the pilot's 4 hours |
 | ~~**P12**~~ | ~~Which encoder is used for the tier-4 embeddings?~~ | — | **Closed — there is no embedding tier** (§4.3.4). Kept as a numbered entry so the other documents' references to P12 resolve rather than dangle |
 | **P13** | **Where does the out-of-distribution signal for [`llm-fallback-policy.md`](./llm-fallback-policy.md) §2 case 4 now live?** It was being provided incidentally by tier 4's embedding-distance-to-centroid | ML + `system-architect` | **This is a real requirement that must not vanish with the tier.** It is a *serving-time* signal whose threshold belongs on the production model's validation set, and the production classifier is already an encoder — so it belongs in the classifier spec and the fallback policy, not in the dataset pipeline. Track it as a hand-off, not a deletion |
+| **P15** | **Is the service taxonomy in scope as-is, or are `terraform-provider` (15), `message-queue` (31), `cdn` (38) and `dns` (41) descoped, merged, or accepted as report-only?** | **Product owner**, on the Phase-0 report (§4.0.1) | [measured] these four cannot be evaluated at the planned 2,000-ticket gold test size — reaching 50 test positives would need 15,625 / 7,463 / 6,098 / 5,618 tickets respectively. **This is a scoping decision, not a modelling one, and it should be taken in week 1 from the Phase-0 report rather than discovered in week 5 from an evaluation table.** Classifier spec §4.8 already requires a mapping table for any merge |
+| **P16** | **Is a longer collection window or targeted enrichment sampling available for the rare tail?** | Product owner + backend | The only two levers that create rare positives; resampling cannot (§4.0.1.4). Enrichment needs its own reweighting and **cannot be the main test set** (runbook §0), so its cost is not just annotation |
 | **P14** | **Widen the tier-3 selector to `score < 0.30` (~285-row queue, ~28 h) or keep `< 0.20` (~200 rows, ~25 h)?** | Support lead + ML, with P4 | §4.3.11. The widening buys [measured, validation §3.7] roughly +14pp injected-error recall on the ambiguous process for ~3.6 h. **Decide on the real export's flag rate (P10), not on this fixture's** |
 
 ---
@@ -2386,6 +2648,7 @@ contradict me freely on any of them.
 | `corpus.parquet` (or equivalent) | one row per ticket: `row_uid`, raw fields, Tier-A `model_input_text`, canonical `services`, `label_provenance`, `dup_cluster_id`, `lang_primary`, `code_switched`, quality flags, per-phase audit counters | ~5 MB at 5k rows [estimate] |
 | `preprocess.json` | **the Tier-A contract**: detector inventory + patterns, placeholder set, protected-span list, folding rules, input template, `max_len`, truncation strategy, blocklist hash, `preprocess_version` | see P7 |
 | `boilerplate_blocklist.txt` | frozen sentence blocklist, derived **from the training split only**, human-reviewed | 9 KB at 149 entries [measured] |
+| **`label_profile.md` + `label_profile.json`** | the Phase-0 report (§4.0.1.6): one-line summary, per-service table with tiers and projected split counts, cardinality histogram, per-quarter and per-language breakdowns, co-occurrence by reference, and the diff against the previous snapshot. **Linked from the snapshot manifest and rendered, not just serialised** | < 100 KB |
 | `gold_ids.json` | the frozen gold-set ID list, content-hashed | small |
 | **`label_conflicts.parquet`** | tier-1 output: group id, grouping method, threshold, member row ids, member label sets, `conflict_grade`, action taken | small |
 | **`tier2_pred_probs.npy` + `tier2_folds.json`** | the `(N, 20)` out-of-sample probability matrix and the exact `GroupKFold` assignment. **Both are required for reproducibility** — cleanlab's output is a pure function of these, so keeping them means a flag list can be re-derived without re-training | ~740 KB at 4,622 rows, fp64 [computed] |
@@ -2438,6 +2701,10 @@ preprocessing is.
 
 Stated as constraints, with the design left open:
 
+0. **Phase 0 (§4.0.1) runs immediately after ingest and before Phase 1**, reads only `services`,
+   `created_at` and the text, writes only a report, and **G19 stops the build from its result**.
+   It must be runnable standalone against a raw CSV with no other stage configured — that is its
+   whole point. Phase numbering is deliberately 0 so existing cross-references stay valid.
 1. Phase ordering is a correctness property, not a performance choice: deterministic redaction
    **before** any LLM call; gold sample drawn **before** any Phase-3 tier; the gold-set assertion
    aborts the run (§4.3.13).
@@ -2475,6 +2742,12 @@ Stated as constraints, with the design left open:
 
 ### 9.5 Sequencing
 
+0. **Day 1, before anything else — Phase 0 on the real export** (§4.0.1). Seconds of pandas, no
+   dependencies, no budget approval. It answers whether the corpus can support the taxonomy at
+   all, and **a T-0 service (G19) or a tail that cannot reach 30 projected test positives is a
+   scoping conversation with the product owner, not a pipeline run.** Running this after the
+   build is the mistake this phase exists to prevent: the answer costs seconds and it gates
+   ~$25 of LLM calls and ~28 person-hours.
 1. **Week 1** — Phase 1 end to end on the fixture. Canary set v1. Human sample n=200. Gates
    G1–G8. **This alone produces a usable corpus**, and per §3 it may be all that is needed.
 2. **Week 1** in parallel — the NER latency benchmark (P5) and the B0-vs-B1 ablation.
