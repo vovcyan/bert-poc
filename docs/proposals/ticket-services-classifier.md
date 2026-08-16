@@ -181,7 +181,7 @@ Rejecting an LLM on the main path (§4) does not rule it out on the paths the cl
 | 50,000 | base | **67 min** | 35 min | 14 min |
 | 200,000 | base | 268 min | 139 min | 56 min |
 
-Derived from the standard `C ≈ 6·N·T` rule at 25% MFU, with embeddings frozen. **Apply a 1.5–2× fudge** for dataloading and evaluation passes.
+Derived from the standard `C ≈ 6·N·T` rule at 25% MFU, with embeddings frozen. **Apply a 1.5–2× fudge** for data loading and evaluation passes.
 
 - **VRAM: 4–6 GB** (batch 32 × 256 tokens, mixed precision, embeddings frozen). Fits a T4 comfortably; an 8 GB card works at batch 16.
 - **A single T4 or any ≥16 GB GPU is sufficient.** No multi-GPU, no distributed training, no cluster.

@@ -680,7 +680,7 @@ A100 = 312 TFLOPS. Attention FLOPs are excluded by the 6N rule and add < 10% at 
 | 50,000 | base | 65.4 PFLOP | **67 min** | 35 min | 14 min |
 | 200,000 | base | 261 PFLOP | 268 min | 139 min | 56 min |
 
-**Apply a 1.5–2× fudge** for dataloading, evaluation passes, and imperfect MFU. So: a single
+**Apply a 1.5–2× fudge** for data loading, evaluation passes, and imperfect MFU. So: a single
 base-model run on 50k tickets is a **~1.5–2 hour T4 job**; the full 24-trial search is
 **~1.5–2 GPU-days on a T4**, or ~half a day on an A100. A T4 or any ≥16 GB GPU is sufficient.
 
