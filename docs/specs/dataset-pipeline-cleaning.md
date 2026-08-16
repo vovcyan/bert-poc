@@ -2,9 +2,23 @@
 
 Status: specification (not implemented)
 Author: ml-researcher
-Date: 2026-08-16
+Date: 2026-08-16 (revision 2)
 Input: [`data/raw/tickets_export.csv`](../../data/raw/tickets_export.csv) (5,013 rows)
 Output: a versioned training corpus for the multi-label ticket→services classifier
+
+**Changes in revision 2**, both substantive, both folded into the text rather than appended:
+
+1. **Application-secret detection is removed entirely.** The product owner states production
+   `title`/`description` contain no secrets, API keys or program keys (§2.3). The `gitleaks` /
+   `detect-secrets` rule packs, the entropy analysis, the secret canary classes and the
+   secret-recall gates are gone. The **PII tier is unchanged and extended** with bank and
+   transactional details, and unconditional URL query-string stripping survives as a plain
+   normalisation rule (§4.1.4). The fixture contradicts the premise by construction — see §2.4.
+2. **Phase 3 is restructured as a cheap-first cascade** (§4.3): deterministic label conflicts →
+   TF-IDF + grouped CV → cleanlab confident learning → embedding kNN and a taxonomy diagnostic →
+   LLM judge on the residual only → human review. The judge now sees **6.2% of labelled rows**
+   and makes **~375–600 calls** instead of ~6,000; the human queue drops from ~650 rows / 46 h to
+   **~200 rows / ~25 h**. §4.3.12 states the condition under which the judge is dropped entirely.
 
 **Companion documents — read these first, this one sits under them:**
 
@@ -27,7 +41,7 @@ deliverable. Numbers tagged **[estimate]** are arithmetic with the working shown
 
 ---
 
-## 0. Repo state, and three disagreements with the brief stated up front
+## 0. Repo state, and the four arguments this document turns on
 
 ### 0.1 Existing assets
 
@@ -37,9 +51,11 @@ notebooks, no preprocessing module, no `preprocess.json`, no model artifacts, no
 `ticket_messages` companion table. Everything below is specified from scratch. Nothing is
 being reused because there is nothing to reuse.
 
-### 0.2 Three places where I do not agree with the brief
+### 0.2 Four load-bearing arguments, stated before anything else
 
-These are the load-bearing arguments in this document, so they go first rather than buried.
+Three of these are places where I do not agree with the brief; the fourth is a correction the
+user made to their own brief in revision round 2, which I agree with and have argued for below
+rather than merely complied with.
 
 **(1) Phase 2 must not rewrite the text the model reads.** The brief's framing ("bounded
 rewrite/extraction under a structured-output schema") is right about *bounded* and right about
@@ -62,7 +78,7 @@ code decides — while removing the skew and the per-request LLM cost. §4.2 spe
 is foreclosed by the contamination rule, not by cost: **Phase 2 must run on the gold val/test
 rows** (their text must be preprocessed identically to training text, or you have skew inside
 your own evaluation), and **Phase 3 must never run on the gold rows** (§5 of the LLM fallback
-policy). A fused call cannot satisfy both. There is a second, independent reason in §4.3.4.
+policy). A fused call cannot satisfy both. There is a second, independent reason in §4.3.9.
 
 **(3) Placeholder normalisation is not a token-budget play on this corpus.** Classifier spec
 §4.6 estimates that placeholder normalisation "typically recovers 10–30% of the token budget".
@@ -72,6 +88,19 @@ skew-stability, not tokens. What *does* recover budget is boilerplate removal: 5
 and **65.1%** on the 99 auto-alert rows. Section §4.1.6 has the table. I am not asking anyone to
 change §4.6 — its estimate was explicitly flagged as one to measure per corpus. This is the
 measurement, and this corpus does not support it.
+
+**(4) Label-error detection is a cheap-first cascade, and the LLM judge is its last and
+smallest tier.** Sending every labelled row to an LLM judge — the design in this document's
+first revision, ~6,000 calls — is neither the cheapest nor the best-grounded instrument
+available, and the measurements are one-sided. A **TF-IDF + one-vs-rest logistic regression**
+pass with grouped cross-validation costs **[measured] 113 seconds** on this corpus and produces
+out-of-sample probabilities; **cleanlab 2.9.0** confident learning over those probabilities
+flags **[measured] 95 of 4,622 rows (2.06%)** as likely mislabelled, and ranks all of them.
+Feeding only the residual to the judge takes Phase 3 from ~6,000 LLM calls to **~375–600 calls
+on [measured] 288 rows (6.2% of labelled rows)** — a 10–16× reduction — and it moves most of the work
+onto instruments that carry **zero contamination risk**, because they never emit an opinion
+about a label, only a routing signal. §4.3 is rewritten around this. §4.3.12 gives the condition
+under which the LLM tier should be dropped entirely.
 
 ---
 
@@ -105,8 +134,9 @@ Four things, in priority order. The first is a hard constraint, not a metric.
    reproducible at inference from a frozen artifact, with no LLM in the loop and no corpus-wide
    statistic that is unavailable for a single unseen ticket. This is binary: a pipeline that
    fails it is not shippable regardless of its other numbers.
-2. **No leakage of PII or secrets into the training corpus, model artifacts, or logs.**
-   Measured against seeded canaries (§6.4), gated at recall ≥ 0.99 for structured classes.
+2. **No leakage of personal data into the training corpus, model artifacts, or logs** — names,
+   contact details, company identifiers, and bank/transactional details. Measured against seeded
+   canaries (§6.4), gated at recall ≥ 0.99 for structured classes.
 3. **No destruction of signal.** The pipeline must not strip the spans that carry the label.
    Measured as over-redaction rate on protected technical strings (§6.4), gated at ≤ 0.5%.
 4. **Measurable value per phase.** Phase 2 and Phase 3 must each demonstrate a gain on the
@@ -166,15 +196,21 @@ Three consequences that belong in the classifier spec's hands:
 - The 99 auto-alert rows go from **217.5 to 76.0 mean tokens (−65.1%)**. Almost the entire
   token-budget win in this pipeline comes from one deterministic rule.
 
-### 2.3 PII, secret and identifier inventory [measured]
+### 2.3 PII and identifier inventory [measured]
 
 Counts are over `title + "\n" + description`. "Rows" = rows containing ≥1 instance.
+
+**Scope note, and it changes what this pipeline is for.** The product owner states that
+**production ticket `title`/`description` contain no application secrets, API keys or program
+keys**, and this specification takes that as authoritative (see §2.4). There is therefore no
+credential-detection tier anywhere in this pipeline. What the pipeline is built to remove is
+**personal and commercial data**: names, contact details, company identifiers, and
+bank/transactional details.
 
 | Class | Rows | Instances | Detectable by | Verdict (§4.1.4) |
 |---|---|---|---|---|
 | E-mail address | 262 | 265 (189 distinct) | regex | `<EMAIL>` |
-| URL | 210 | 210 (110 with a query string) | regex | `<URL:{host_class}>`, query dropped |
-| **URL-borne secret** (`?token=`, `&sig=`, `key=`) | 109 | **81 values, 80 distinct** | **structure, not entropy** | `<URL:...>` (destroyed by construction) |
+| URL | 210 | 210 (110 with a query string) | regex | `<URL:{host_class}>`, query and fragment dropped |
 | Phone `+7…` | 126 | — | regex (6 surface formats present) | `<PHONE>` |
 | Phone `+1…` | 53 | — | regex | `<PHONE>` |
 | Card-like (`4111 11** **** 1111`) | 21 | — | regex; **partially masked already**, so a naive 13–19-digit-run regex matches **0** | `<CARD>` |
@@ -183,11 +219,14 @@ Counts are over `title + "\n" + description`. "Rows" = rows containing ≥1 inst
 | Legal entity `ООО «…»` | 32 | 33 | regex | `<ORG>` |
 | Person name, RU (two capitalised words) | 359 | 370 | NER required | `<PERSON>` |
 | Person name, EN (`Firstname Lastname` shape) | 265 | 282 (145 distinct) | NER required | `<PERSON>` — **see the trap below** |
+| Money amount (`… ₽`, `… руб`) | 36 | 37 | regex | **preserved** — a billing-signal quantity, not an identifier |
+| Bank / account / transaction identifiers (р/с, БИК, СНИЛС, 20-digit account, payment reference) | **0** | 0 | regex, checksum-validatable | `<ACCOUNT>` / `<BIC>` — **untested by this fixture**, see §7.1 |
+| паспорт (`45 03 123456`) | **0** | 0 | keyword + regex | `<PASSPORT>` — untested by this fixture |
 | IPv4 | 17 | — | regex | `<IP>` |
 | ISO timestamp | 100 | — | regex | `<TS>` |
 | Host/resource id (`i-55ba20`, `db-01`, `lb-prod`, `api-gw-1`) | 182 | 219 | regex | **preserved** (§4.1.4) |
-| base64-ish run ≥32 chars | 1 | 1 | regex | `<B64>` |
-| UUID · JWT · AWS key · SSH private key · connection string · `Bearer` · `password=` | **0** | 0 | regex | rules kept as insurance |
+| base64-ish run ≥32 chars | 1 | 1 | regex | `<B64>` — a token-budget rule, not a security rule |
+| UUID | 0 | 0 | regex | `<UUID>`, insurance |
 
 **The trap, and it is the single most important measurement in this document.** Of the 282
 English `Firstname Lastname`-shaped matches, **126 (45%) are technical strings, not people**:
@@ -199,24 +238,15 @@ redact exactly the HTTP reason phrases and PostgreSQL plan nodes that are the st
 signal in the corpus. This is why §4.1.3 makes **protected-span masking strictly precede
 detection**, and why §6.4 gates on over-redaction precision and not only on recall.
 
-### 2.4 Why entropy-based secret detection is not usable here [measured]
+### 2.4 The fixture over-states one risk class, and it is the one we are not building for
 
-The 81 secret values found in URL query strings:
-
-- length **3–14 characters** (median 12);
-- Shannon entropy **1.58–3.81 bits/char** (median 3.08);
-- **0 of 81** exceed `detect-secrets`' default `Base64HighEntropyString` limit of **4.5**;
-- **49 of 81 (60%)** exceed its default `HexHighEntropyString` limit of **3.0**, so even the
-  permissive detector has a **40% false-negative rate** on this corpus
-  ([Yelp/detect-secrets](https://github.com/Yelp/detect-secrets), Apache-2.0; the project itself
-  states it "is not meant to be a sure-fire solution to prevent secrets from entering the
-  codebase").
-
-Short opaque tokens in customer-pasted URLs are *structurally* obvious and *statistically*
-invisible. The design consequence is in §4.1.4: **redact the container, not the value.** Drop
-the entire URL query string unconditionally and you destroy 81/81 by construction, with no
-detector accuracy involved. That is a property, not a measurement, and it is the only kind of
-guarantee worth having about secrets.
+Production `title`/`description` carry no application secrets (§2.3), but **this fixture carries
+them by construction**: its README documents 108 of 210 URLs bearing a token or key, and
+[measured] 81 such values are present. Any secret-detection or canary result computed on this
+file therefore describes the generator, not production, and no gate in §6 is keyed on it. The one
+rule that survives from this observation is unconditional URL query-string stripping (§4.1.4) —
+and it survives on **normalisation** grounds (high-entropy, zero-signal, eats token budget), not
+security grounds.
 
 ### 2.5 Duplication and burst structure [measured]
 
@@ -253,6 +283,38 @@ boundary — that is the actual leakage surface, and it is small and cheap to fi
 Burst days [measured], for the ≥1-week gap rule: 2025-11-18 (110 tickets), 2026-03-05 (99),
 2026-06-23 (76), 2025-09-09 (58), 2026-04-14 (42), 2026-01-21 (42), 2026-05-27 (38),
 2025-12-03 (28).
+
+#### 2.5.1 Label conflicts inside duplicate groups [measured]
+
+The same clusters answer a second question that Phase 3 tier 1 (§4.3.2) depends on: **do
+duplicate texts carry the same labels?** Grading rule as defined in §4.3.2 (`identical` /
+`nested` / `partial` / `disjoint`), restricted to groups with ≥2 *labelled* rows:
+
+| Grouping | Groups | Rows | identical | nested | partial | disjoint |
+|---|---|---|---|---|---|---|
+| Exact `title`+`description` | 0 | 0 | — | — | — | — |
+| Exact `description` | 6 | 12 | 3 | — | — | 3 groups / 6 rows differ, ungraded |
+| Exact `title` (normalised) | **565** | **1,513** | 564 | **1** (2 rows) | 0 | 0 |
+| Near-dup, Jaccard 0.80 | 29 | 164 | 27 | 1 (2 rows) | **1 (98 rows)** | 0 |
+| Near-dup, Jaccard 0.60 | 316 | 835 | 313 | 1 (2 rows) | 1 (99 rows) | **1 (3 rows)** |
+
+Three readings, and the third is the one that changes the design:
+
+- **The fixture is internally consistent, so tier 1 finds almost nothing here.** 564 of 565
+  same-title groups carry byte-identical label sets. That is a property of a generator that
+  assigns labels from a scenario, not a property of real annotation. On a real corpus with a
+  CatBoost-contaminated `services` column this tier is where the cheapest wins live; here it
+  yields **~14 reviewable rows.** Report that honestly and re-run it on real data before drawing
+  any conclusion about tier 1's yield.
+- **Strict set-inequality would be badly wrong.** The single `partial` group at Jaccard 0.80 is
+  the **98-row auto-alert clique**, whose members differ legitimately: `[managed-postgres,
+  monitoring]` for a connection-error alert versus `[compute, monitoring]` for a CPU alert. A
+  naive "duplicate texts with different labels ⇒ conflict" rule would dump 98 rows into a human
+  queue for behaving correctly. §4.3.2's graded rule plus a cluster-size guard routes 5.
+- **The one genuine `disjoint` conflict** is a 3-row group titled `METRICS VIA API`, labelled
+  `[api-gateway, monitoring]` on one row and `[console-ui]` on two others. That is exactly the
+  `console-ui`-versus-the-broken-component ambiguity from §2.8, found with no model at all — which
+  is the argument for putting this tier first.
 
 ### 2.6 Boilerplate [measured]
 
@@ -318,7 +380,10 @@ Ambiguous-pair prevalence, which sizes Phase 3:
 | Rows touching **any** ambiguous-family service | **2,730 (59.1% of labelled rows)** | | |
 
 That last row is why "route ambiguous cases to a human" is not a routing rule. 59% of the corpus
-is not a queue, it is the corpus. §4.3.6 specifies a rule that routes ~14%.
+is not a queue, it is the corpus. §4.3.5 sharpens "ambiguous" into a *measurable* condition using
+the tier-2 out-of-sample probabilities — carries one member of a pair while the model prefers the
+other — which [measured] selects **6 rows** for the four pairs and **65 rows** for `console-ui`,
+not 2,730.
 
 ### 2.9 Licensing and residency
 
@@ -340,9 +405,18 @@ against these.
 |---|---|---|---|
 | **B0** | **Raw passthrough** | `title + "\n" + description`, no processing at all beyond CSV parsing and `services` canonicalisation | The floor. If B1 does not beat this on the gold test set, the entire pipeline is ceremony. Cheap to run |
 | **B1** | **Phase 1 only** | §4.1 deterministic pipeline, no LLM anywhere | **The real baseline.** This is the trivial-baseline slot from classifier spec §3, transposed to the data layer. Phase 2 and Phase 3 must each beat *this*, not B0 |
-| **B2** | **Phase 1 + Phase 3 (judge), no Phase 2** | labels adjudicated, text deterministic | Isolates label repair from text cleaning |
-| **B3** | **Phase 1 + Phase 2, no judge** | text improved via mined rules, labels untouched | Isolates text cleaning from label repair |
-| **B4** | Full pipeline | | Must beat max(B2, B3) or the extra phase is dropped |
+| **B2** | **Phase 1 + Phase 3 cheap tiers** (conflicts, cleanlab, kNN), no LLM judge | labels repaired by the zero-contamination tiers only | **New in revision 2, and the important one.** If B2 captures most of the available gain, the LLM tier is not worth its contamination risk (§4.3.12) |
+| **B2b** | B2 + LLM judge | full Phase 3 | Isolates the judge's marginal contribution above the cheap tiers |
+| **B3** | **Phase 1 + Phase 2, no Phase 3** | text improved via mined rules, labels untouched | Isolates text cleaning from label repair |
+| **B4** | Full pipeline | | Must beat max(B2b, B3) or the extra phase is dropped |
+
+**The TF-IDF baseline is no longer discarded after it is measured.** Classifier spec §3 item 3
+already requires "TF-IDF (word 1–2 grams + char 3–5 grams) + one-vs-rest logistic regression" as
+the real baseline to beat. In the first revision of this document that model was computed for the
+classifier comparison and thrown away. It is now **a pipeline instrument** (§4.3.3): its
+out-of-sample probabilities feed confident learning, its ambiguous-pair probabilities define the
+judge's routing stratum, and its metric delta across preprocessing variants is a **GPU-free proxy
+for the §5.2 ablation ladder**. One 113-second CPU job [measured] serves three purposes.
 
 **Also required, and cheaper than all of the above: a no-model check.** Report per-phase row
 counts, token totals, redaction counts, and dropped-row counts as a diff table for every phase.
@@ -377,7 +451,7 @@ Tier assignments at a glance:
 |---|---|
 | Unicode/NFC, whitespace, quotes, `ё`, mojibake, CSV artefacts | A |
 | Quote/signature stripping, boilerplate blocklist, template footers | A |
-| Regex placeholder substitution (email, phone, URL, card, ИНН, IP, TS, IDs, secrets) | A |
+| Regex placeholder substitution (email, phone, URL, card, ИНН, bank/transaction details, IP, TS, IDs) | A |
 | Log/traceback skeleton reduction | A |
 | Input template assembly, truncation | A |
 | NER-based `<PERSON>` / `<ORG>` redaction | A **only if** the budget in §4.1.5 is met; otherwise B |
@@ -506,7 +580,7 @@ never "is this useful?" but "can we do this identically, cheaply, forever?"**
 | Corpus-frequency boilerplate sentences | exact-match against a frozen blocklist of sentences occurring ≥20× **in the training split only** | 149 types, 9,935 instances = **48.2%** of sentence instances; only 1.2% of stripped mass is technical, and that is protected by §4.1.3 | Generic "moves" (`Мешает работать, но не блокирует.` ×123). They occur in every class, so they are label-independent noise. Sentence-level exact match is the safest possible deletion primitive |
 | Quoted reply blocks | lines matching `^\s*>`, plus the `> On <date>, X wrote:` inline form | 10 rows here (`^>`), 3 inline; `wrote:`/`писал:` 10 | The quoted text is a *different* ticket's content and mislabels this one. Delete rather than mark, since the quote depth is not signal |
 | Signature blocks | from a sign-off marker (`С уважением`, `Best regards`, `Kind regards`, `Regards,`, `--` on its own line) to end of field, capped at 5 lines | `С уважением` 154 rows, `Regards` 72 | Names, phones, titles, company blurbs. Deleting is cheaper and safer than redacting each element |
-| URL query strings and fragments | everything after `?` or `#` | 110 of 210 URLs | **The secret story, §2.4.** 81/81 URL secrets die by construction, no detector involved |
+| URL query strings and fragments | everything after `?` or `#` | 110 of 210 URLs | **A plain normalisation rule.** Query strings are high-entropy, near-zero-signal, per-row-unique spans of exactly the kind classifier spec §4.6 says to normalise away — the same argument as `<UUID>` and `<TS>`. It happens also to destroy this fixture's 81 URL-borne tokens by construction (§2.4), but that is a side effect, not the justification |
 | Whitespace runs, zero-width, CSV artefacts | §4.1.2 | 207 rows | Noise, no information |
 
 **REPLACED by a stable placeholder** (the placeholder is a special token, §4.1.6):
@@ -517,13 +591,22 @@ never "is this useful?" but "can we do this identically, cheaply, forever?"**
 | `<PHONE>` | regex, 6 RU + 2 EN surface formats | 179 rows | Same |
 | `<URL:{class}>` | regex; `{class}` from a **first-party host allowlist** (`docs`, `api`, `logs`, `portal`, `cdn`, `app`, `hooks`) else `other` | 210 URLs; allowlist covers 208/210 | `hooks.*` → `integrations`, `cdn.*` → `cdn` is real signal. The host is first-party and therefore not PII; path and query are dropped |
 | `<CARD>` | regex over digit runs **including `*` masks** — a plain `\d{13,19}` regex matches **0** here because the fixture pre-masks them | 21 rows | Presence of a card is signal for `billing` |
+| `<ACCOUNT>` | 20-digit RU settlement account (р/с, к/с), keyword-anchored; Luhn/checksum-validated where the format allows | **0 here** | The product owner named bank and transactional details explicitly. **This detector has no positive test case in this fixture** (§7.1) and rests entirely on canaries (§6.4) |
+| `<BIC>` | `БИК` + 9 digits | **0 here** | Same |
+| `<TXN>` | payment/transaction reference: keyword-anchored (`платёж`, `транзакц`, `payment id`, `order`) + alphanumeric run | **0 here** | Same |
+| `<PASSPORT>` | `паспорт` / `серия … номер` + `\d{2}\s?\d{2}\s?\d{6}` | **0 here** | Same |
 | `<INN>` | keyword-anchored 10/12-digit value + control-digit validation | 143 rows keyword, 24 with value | Presence signals `billing`/accounting documents |
-| `<ORG>` | `(ООО|АО|ЗАО|ПАО|ИП)\s*[«"]…[»"]` | 32 rows | Legal-entity names are identifying; the *fact* of one is billing signal |
+| `<ORG>` | `(ООО|АО|ЗАО|ПАО|ИП)\s*[«"]…[»"]` plus NER ORG | 32 rows regex | Legal-entity names are identifying; the *fact* of one is billing signal |
 | `<IP>` | regex, both v4 and v6 | 17 rows | Networking signal; the address itself is customer infrastructure |
 | `<TS>` | ISO-8601 and common RU/EN date forms | 100 rows | High-entropy, zero-signal, per §4.6's list |
 | `<ID>` | `req_[0-9a-f]+`, `rule_\d+`, `i-[0-9a-f]{6}`, ticket/order ids | 182 rows / 219 instances | **Placeholder, not preserve.** The *class* of identifier is signal (a `req_` id means the user pasted an API response); the value is unique per row, so preserving it adds one hapax per row and zero generalisation |
-| `<UUID>`, `<B64>`, `<JWT>`, `<SECRET>`, `<KEY>` | regex; `<SECRET>` also fires on `(?i)(token|secret|ключ|пароль|password|api[- ]?key)\s*[:=]\s*\S+` outside URLs | 0 / 1 / 0 / — here | Insurance. Absent from this fixture, certain to appear in a real export |
+| `<UUID>`, `<B64>` | regex | 0 / 1 here | **Token-budget rules, not security rules.** A 32-char base64 run costs ~11 tokens and carries no label signal |
 | `<PERSON>` | NER — see §4.1.5 | 359 RU + 265 EN rows | Names carry no service signal; the placeholder keeps grammar intact |
+
+**Money amounts are preserved, account numbers are not.** `12 400 ₽` (36 rows [measured]) is a
+billing-signal quantity of the same kind as `16 ТБ`; a settlement account is an identifier with
+no signal at all. The distinction is "does the *value* generalise across tickets" — amounts
+loosely do, identifiers never do.
 
 **PRESERVED verbatim.** Everything in the §4.1.3 protected list, plus: all prose, all product
 and component nouns in both languages, priority, case, and single newlines.
@@ -575,12 +658,17 @@ recognizer we write ourselves. **Presidio buys structure, not coverage.**
 
 #### 4.1.6 Placeholder tokenisation
 
-[measured] under XLM-R, angle-bracket placeholders cost **3–5 tokens each**: `<EMAIL>` →
-`['▁<','E','MAIL','>']` (4), `<SECRET>` → 5, `<URL>`/`<PHONE>`/`<ID>`/`<TS>` → 3.
+[measured] under XLM-R, angle-bracket placeholders cost **3–5 tokens each**:
+
+| Tokens | Placeholders |
+|---|---|
+| 5 | `<ACCOUNT>` (`▁< AC CO UNT >`) |
+| 4 | `<EMAIL>` · `<CARD>` · `<PERSON>` · `<PASSPORT>` · `<TXN>` · `<BIC>` |
+| 3 | `<URL>` · `<PHONE>` · `<ID>` · `<TS>` · `<IP>` · `<INN>` · `<ORG>` · `<UUID>` · `<B64>` |
 
 Classifier spec §4.6 says to add special tokens "only if the redaction placeholders are
 themselves over-segmented". **They are.** Recommendation: **add the placeholder set as special
-tokens and resize the embedding matrix** — 11–14 tokens, each becoming a single unsplittable id.
+tokens and resize the embedding matrix** — ~15 tokens, each becoming a single unsplittable id.
 This also removes a real failure mode: a ticket whose text legitimately contains `<URL>` cannot
 be confused with a redaction. Per §4.6's ordering rule, if vocabulary trimming ever happens,
 **trim last**.
@@ -736,51 +824,49 @@ Nothing is deleted. Every filter sets a reason code and the row stays in the sna
 | PII orchestration | **presidio** | MIT | recognizer registry, span+score audit records, stable anonymiser placeholders | hand-rolled span engine, if presidio's dependency weight is unacceptable at inference | **English-only by default**; every RU entity is a recognizer we write; context words must be translated; explicit no-guarantee disclaimer |
 | RU NER backend | **slovnet (Natasha)** | MIT | PER F1 0.959 factRuEval, 27 MB / 205 MB RAM / CPU-only, 60× smaller than BERT SOTA at 1–2% cost | spaCy `ru_core_news_lg` if a spaCy pipeline is wanted for other reasons; a RU BERT NER if F1 must go higher and the Tier-A budget allows | ORG F1 0.825 is the weak spot, and ORG is exactly where `ООО «Ромашка-Сервис»` lives — back it with the regex rule, do not rely on NER alone |
 | PII, generic | **scrubadub — ruled out** | Apache-2.0 | detectors are US/GB-centric (SSN, GB driving licence, US/GB/CA postcodes); name detection add-ons are English spaCy/Stanford | — | no Russian entity coverage at all; nothing here is reusable |
-| Secret regex pack | **gitleaks rules** (ported), + **detect-secrets** keyword/plugin detectors | MIT / Apache-2.0 | gitleaks is MIT, config-driven TOML rules with per-rule entropy and stopword allowlists, and scans arbitrary directories | — | rule packs target developer credentials, not customer-pasted URL tokens — **our own URL/keyword rules do the real work** |
-| Secret verification (audit only) | **trufflehog** | **AGPL-3.0** | 700+ detectors with *live credential verification*, which nothing else offers | — | **Do not link it into the pipeline** — AGPL-3.0 on a proprietary internal service is a question for legal that we do not need to ask. Run it out-of-band as a CLI over the finished corpus as a release gate (§6.3) |
-| Entropy detection | **not used as a primary detector** | — | [measured] 0/81 secrets at the 4.5 default, 49/81 at 3.0 | — | — |
+| Credential / secret detection | **none — the whole tier is removed** | — | §2.3: production `title`/`description` carry no application secrets. `gitleaks`, `detect-secrets` and `trufflehog` were all ruled in by the first revision of this document and are **all ruled out now**. Carrying a credential scanner "just in case" is dead scaffolding: it costs a dependency, a licence review (trufflehog is AGPL-3.0), and a gate that can only ever fire on a false positive | Reinstate only if the premise in §2.3 is withdrawn — that is open question P6 | — |
 | RU morphology | **pymorphy3** | MIT | maintained continuation of pymorphy2; needed for the TF-IDF/keyword baselines' lemmatisation and RU service-synonym matching | — | **not needed for the encoder path** — SentencePiece handles morphology; scope it to baselines only |
+| Label-error detection | **cleanlab 2.9.0**, multi-label API | Apache-2.0 | confident learning over out-of-sample probabilities; §4.3.3 | — | language-agnostic — it never sees the text, only `pred_probs` |
+| Tier-2 model + kNN | **scikit-learn** (TF-IDF, OvR logistic regression, `GroupKFold`); **sentence-transformers** for the §4.3.4 embedding tier | BSD-3 / Apache-2.0 | already required by classifier spec §3 baselines 3 and 5 | — | char 3–5 grams handle RU morphology without a lemmatiser |
 | Language ID | **lingua-py** (`{ru,en}` only) | Apache-2.0 | span-level multi-language output; strong on short text | **py3langid** (BSD-3) kept as a cross-check; **fastText lid.176** only at ≥1M rows | none material for RU/EN; the risk is running it on unmasked text |
 | Near-duplicates | **datasketch MinHashLSH** | MIT | cluster ids as a column; 2.1 ms/row [measured] | **text-dedup** (Apache-2.0) above ~1M rows or for a Spark backend; **SimHash never** | char-5-grams are language-agnostic; RU morphology is handled by character n-grams |
 | E-mail quote/signature | **own deterministic rules first**; **talon** (Apache-2.0) only if quote markers exceed 2% of rows | Apache-2.0 | [measured] only 10 rows have `^>` quoting here; talon's ML signature classifier was trained on English ENRON mail and has no documented Russian support | `email-reply-parser` (MIT) is simpler but equally English-pattern-driven | **`С уважением` is 154 rows and neither library knows it** — the RU sign-off marker list is ours to write and version either way |
 | Row representation | **polars → Parquet**, one file per phase, never in place | MIT / Apache-2.0 (pyarrow) | columnar, typed, hashable, cheap to diff between phases | **pandas** is fine at 5k rows and this choice is aesthetic below ~100k; it stops being aesthetic at 1M | — |
 | Training handoff | **HF `datasets`** at the training boundary only | Apache-2.0 | Arrow-backed, integrates with the trainer | — | — |
 
-**Where the honest gap is.** [measured] this fixture contains **zero** JWTs, AWS keys, SSH keys,
-connection strings, `Bearer` headers, or `password=` assignments. Every detector for those
-classes is therefore **completely untested by this corpus**. Their correctness rests entirely on
-the seeded-canary protocol in §6.4. Do not read a green Phase-1 gate on this fixture as evidence
-that secret handling works.
+**Where the honest gap is.** [measured] this fixture contains **zero** bank accounts, БИК codes,
+СНИЛС, passport numbers, transaction references, or UUIDs. Every detector for those classes is
+therefore **completely untested by this corpus**, and they are precisely the classes the product
+owner named as material. Their correctness rests entirely on the seeded-canary protocol in §6.4.
+Do not read a green Phase-1 gate on this fixture as evidence that bank-detail handling works.
 
-#### 4.1.13 The honest answer on secret false negatives
+#### 4.1.13 The honest answer on PII false negatives
 
-**No deterministic detector has an acceptable false-negative rate for a secret, and neither does
-Phase 2.** [measured] entropy misses 100% at the standard base64 threshold and 40% at the hex
-threshold; regex packs only find shapes someone anticipated; an LLM second opinion is a
-probabilistic detector with no recall guarantee and — critically — **it has already seen the
-text by the time it reports.** Nobody should present any of these as a compliance story.
+**No detector removes all personal data, and neither does Phase 2.** Regex only finds shapes
+someone anticipated; NER on Russian is [measured by its authors] PER F1 0.959 and **ORG F1
+0.825**, so roughly one company name in six is missed; and an LLM second opinion is a
+probabilistic detector with no recall guarantee that — critically — **has already seen the text
+by the time it reports.** None of these is a compliance story on its own.
 
-The defence-in-depth answer has six layers, and only the first is a guarantee:
+Four layers, and only the first is a guarantee:
 
-1. **Structural destruction, not detection.** Drop URL query strings and fragments
-   unconditionally; drop the entire value after a secret-ish key name; drop signature blocks
-   wholesale. [measured] this kills 81/81 of this corpus's secrets **by construction**. Prefer a
-   rule that cannot miss over a detector that usually does not.
-2. **Regex packs** (gitleaks + detect-secrets keyword plugins) for known credential shapes.
-3. **Seeded canaries with a hard recall gate** (§6.4) — the only quantitative measurement
-   available.
-4. **Phase 2's `residual_pii` output** as an independent second opinion (§4.2.3). It protects
+1. **Structural destruction where the structure allows it.** Delete signature blocks and quoted
+   reply blocks wholesale rather than redacting element by element; drop URL query strings and
+   fragments; delete the auto-alert footer. A rule that removes a whole region cannot miss an
+   entity inside it, and [measured] the signature-block rule alone covers 226 rows where names,
+   phones and job titles cluster.
+2. **Seeded canaries with a hard recall gate** (§6.4) — the only quantitative measurement
+   available, and the only test the bank/passport detectors get at all (§7.1).
+3. **Phase 2's `residual_pii` output** as an independent second opinion (§4.2.3). It protects
    everything downstream of the Phase-2 call; **it cannot protect the Phase-2 call itself**,
-   which is precisely why the phase ordering is load-bearing (§4.2.6).
-5. **An out-of-band trufflehog scan of the finished corpus** as a release gate, with live
-   verification on any hit (§6.3).
-6. **A human read of a stratified sample** (§6.5), plus a standing adversarial exercise: once
-   per snapshot, someone tries to write a ticket that defeats the pipeline, and whatever they
-   find becomes a rule and a canary.
+   which is why the phase ordering is load-bearing (§4.2.6).
+4. **A human read of a stratified sample** (§6.5), plus an **egress self-check** on the finished
+   corpus (§6.3) and a standing adversarial exercise: once per snapshot, someone tries to write a
+   ticket that defeats the pipeline, and whatever they find becomes a rule and a canary.
 
-And one non-technical layer that outranks all six: **keep the corpus inside the perimeter.**
-A residual secret in a corpus that never leaves is an incident waiting to happen; the same
-secret in a corpus posted to a foreign API is an incident that has already happened.
+And one non-technical layer that outranks all four: **keep the corpus inside the perimeter**
+(§4.2.6). Residual personal data in a corpus that never leaves is a risk to manage; the same data
+posted to a foreign API is a 152-FZ event that has already happened.
 
 ---
 
@@ -859,7 +945,7 @@ Structured outputs with `enum` constraints, the same mechanism as
           "quote": {"type": "string"},
           "kind":  {"type": "string",
                     "enum": ["person", "org", "email", "phone", "card", "inn",
-                             "passport", "address", "secret", "account", "other"]}
+                             "passport", "address", "account", "bank", "other"]}
         }
       }
     }
@@ -869,6 +955,12 @@ Structured outputs with `enum` constraints, the same mechanism as
 
 **Allowed to alter:** nothing in the text. It emits indices, enums, booleans, and verbatim
 quotes.
+
+**Note the `other` bucket in `residual_pii`.** There is no `secret` value, because §2.3 says
+production ticket text has none. If the model nonetheless keeps returning credential-shaped
+strings under `other`, that is **evidence to reopen P6** — and it costs nothing, because the
+bucket had to exist anyway. This is the one place a removed premise gets a cheap feedback loop
+rather than a dormant detector.
 
 **Forbidden, and enforced by a validator rather than by instructions:**
 
@@ -968,10 +1060,11 @@ someone later "simplifies" it into a rewrite and reintroduces skew. Weigh those,
 **Default and recommendation: a self-hosted model inside the Russian perimeter for Phases 2 and
 3.** Three reasons, and the first is the one that decides it:
 
-1. **The deterministic redactor's false-negative rate on secrets is not zero and cannot be
+1. **The deterministic redactor's false-negative rate on personal data is not zero and cannot be
    proven to be zero** (§4.1.13). Sending "redacted" text to a foreign API is a bet that the
-   redactor is perfect. [measured] on the fixture's own secrets, standard entropy detection is
-   0-for-81. Do not take that bet with customer text.
+   redactor is perfect. The NER backend's own published **ORG F1 is 0.825**, so roughly one
+   company name in six survives; names in oblique Russian cases are the next-largest gap. Do not
+   take that bet with customer text.
 2. **152-FZ** requires that recording, storage and extraction of Russian citizens' personal data
    occur in databases located in Russia (classifier spec §2.9; open question Q7). Pseudonymised
    text arguably falls outside the regime — but "arguably" is a legal opinion we do not have, and
@@ -997,25 +1090,269 @@ switch is otherwise invisible and irreproducible.
 
 ---
 
-### 4.3 Phase 3 — LLM-as-a-judge, and the human queue
+### 4.3 Phase 3 — label-error detection as a cheap-first cascade
 
-#### 4.3.1 The pattern, reused not reinvented
+#### 4.3.0 The cascade, and why the ordering is what it is
 
-This is [llm-fallback-policy §4.1 constrained adjudication](./llm-fallback-policy.md), applied
-to stored labels instead of to a classifier shortlist. The shortlist is the row's existing
-`services` set; the verdict is accept/reject per candidate; the output is schema-constrained with
-an `enum` over service names, so an invalid service name is not a failure mode that has to be
-handled. Requiring an `evidence` span is a grounding constraint and gives reviewers something to
-audit — same argument, same schema, one addition.
+Phase 3 is **six tiers, cheapest and most-grounded first**, each one narrowing the pool the next
+one sees. The LLM judge is tier 5, not tier 1, and on this corpus it sees **[measured] 6.2% of
+labelled rows**.
+
+| Tier | Instrument | Cost | Contamination risk | Rows it selects on this fixture [measured] |
+|---|---|---|---|---|
+| **1** | Deterministic label conflicts inside duplicate groups (§4.3.2) | free, seconds | **none** — no model involved | ~14 routed, ≤4 masked |
+| **2** | TF-IDF + OvR logistic regression, grouped CV (§4.3.3) | **113 s CPU** | **none** — produces probabilities, not opinions | (produces the input to 3, 5) |
+| **3** | cleanlab confident learning over tier-2 probabilities (§4.3.3) | seconds | **none** — routing signal only, never auto-applied | **161** (mask 95 ∪ quality < 0.20 126) |
+| **4** | Embedding kNN label agreement + UMAP taxonomy diagnostic (§4.3.4) | minutes | **none** | 56 flagged, **34 marginal**; corroborating only |
+| **5** | **LLM judge**, constrained adjudication (§4.3.5–4.3.9) | ~375–600 calls, ~$2–4 | **real** — every verdict is model provenance | **288 rows judged** (union + audit) |
+| **6** | Human review of the residual (§4.3.10–4.3.11) | ~8 person-hours | none | **~200 rows** [estimate] |
+
+**Why this order, argued rather than asserted.** Four reasons, in order of weight:
+
+1. **Grounding.** A tier-1 conflict is *evidence*: two texts that a character-5-gram signature
+   says are the same carry different labels, and at least one of them is wrong or the taxonomy is
+   ambiguous. No model asserted anything. An LLM verdict is an *opinion* with an evidence span
+   attached. Prefer evidence to opinion when both are available, and they are.
+2. **Contamination.** Tiers 1–4 never emit a label and never change one; they emit a *ranking of
+   which rows deserve attention*. Under the fence in §4.3.13 that ranking still may not touch the
+   gold set — but it creates no model-provenance labels, so nothing it flags is disqualified from
+   val/test on provenance grounds. Every LLM verdict does create model provenance. **Doing the
+   same job with a cheaper instrument that carries less permanent cost is the whole argument.**
+3. **Cost, which is not close.** [measured] the tier-2 + tier-3 pass is **113 seconds of CPU and
+   $0** for the whole corpus. The first revision of this document specified ~6,000 LLM calls for
+   the same job. Even at $30 that is a bad trade when the cheap instrument is better grounded.
+4. **Cleanlab is structurally bad at exactly one thing, and that thing is what the LLM is for.**
+   Confident learning assumes a **class-conditional noise process** — labels flip with a
+   probability that depends on the true class
+   ([Northcutt, Jiang & Chuang, "Confident Learning: Estimating Uncertainty in Dataset Labels",
+   JAIR 2021](https://arxiv.org/abs/1911.00068)). When `auth` and `access-control` overlap because
+   the *taxonomy* is ambiguous, there is no flip process to estimate: both labels can be right,
+   and which one is intended depends on a written guideline the model has never seen. That is a
+   definitional question, and the LLM judge — with the decision rule in its prompt (§4.3.6) — is
+   the only automated instrument in this pipeline that encodes the guideline. **That is its
+   non-redundant job, and it is the only one it should be given.**
+
+#### 4.3.1 What each tier may and may not do
+
+One rule, applied uniformly, and it is the thing that keeps the cascade safe:
+
+> **No tier in Phase 3 changes a label automatically. Tiers 1–4 route. Tier 5 routes and, under
+> the narrow unanimity condition in §4.3.9, may auto-apply a *removal*. Only tier 6 (a human)
+> may add a label.**
+
+The empirical justification is in §4.3.3: [measured] dropping the 161 cleanlab-flagged rows from
+training *hurt* macro average precision by 0.79pp on this corpus. Flagged rows were hard, not
+wrong. A pipeline that had auto-applied cleanlab's verdict would have silently degraded the
+dataset and reported a green gate.
+
+#### 4.3.2 Tier 1 — deterministic label conflicts
+
+**Input:** the `dup_cluster_id` columns already produced by §4.1.7 (two signatures, unioned),
+plus exact-match groups on normalised `title`, on `description`, and on `title+description`.
+
+**The conflict grade**, computed over the label sets of a group's labelled rows. Strict set
+inequality is the wrong rule — it fires on legitimate variation — so the rule is graded:
+
+| Grade | Definition | Interpretation | Action |
+|---|---|---|---|
+| `identical` | all pairs equal | nothing to see | none |
+| `nested` | every pair satisfies `A ⊆ B` or `B ⊆ A` | **incompleteness, not contradiction** — one annotator recorded fewer services, which is the runbook §3 "reliable positives, unreliable negatives" problem in miniature | **mask** the missing services out of the negative set for the smaller rows (§4.3.8); do not queue |
+| `partial` | pairwise overlap, but neither nested nor disjoint | genuine ambiguity, *or* a template whose instances legitimately differ | queue, **but cap at 5 rows per cluster** |
+| `disjoint` | some pair shares no service | **hard contradiction, highest-precision signal in the pipeline** | queue every row, always |
+
+**The cluster-size cap is not a nicety.** [measured] the single `partial` cluster at Jaccard 0.80
+is the 98-row auto-alert clique, whose members carry `[managed-postgres, monitoring]` versus
+`[compute, monitoring]` because they are alerts on different resources. A strict rule would put
+98 correct rows in a human queue. The cap routes 5 and records the cluster id so a reviewer can
+pull the rest if the sample looks wrong.
+
+**Yield on this fixture [measured]: ~14 rows queued** (3 `disjoint` at Jaccard 0.60 + 5 sampled
+from the capped 98-row `partial` cluster + 6 from exact-`description` groups) **and up to 4 rows
+masked** (2 `nested` groups, which may overlap between the title and near-dup groupings — the
+implementation must de-duplicate across grouping methods before acting). That is a real finding
+and it must not be generalised: the fixture's labels are author-assigned from a scenario
+bank, so 564 of 565 same-title groups agree exactly. **On a real corpus with a
+CatBoost-contaminated `services` column this tier is where the cheapest wins live.** Re-run it on
+real data before concluding anything about tier 1's value; it costs seconds.
+
+**Report per snapshot:** conflicting groups and rows by grade, by grouping method, and by
+threshold. A rising `disjoint` count between snapshots is an annotation-quality alarm.
+
+#### 4.3.3 Tiers 2 and 3 — TF-IDF probabilities and confident learning
+
+**Tier 2 is the baseline classifier spec §3 item 3 already requires**, computed once and used
+three times.
+
+Specification:
+
+- **Features:** word 1–2 grams (`min_df=2`, sublinear TF) ∪ char\_wb 3–5 grams (`min_df=3`,
+  sublinear TF, 200k features cap). Character n-grams handle Russian morphology without a
+  lemmatiser, which is classifier spec §3's own reasoning.
+- **Model:** one-vs-rest logistic regression, `class_weight='balanced'`, on the **Phase-1 text**.
+- **Cross-validation: `GroupKFold`, 5 folds, grouped on the §4.1.7 near-duplicate cluster id.**
+  This is the subtlety that decides whether the whole tier works. If a row's near-duplicate sits
+  in the training fold, the model predicts that row with inflated confidence, its label-quality
+  score rises, and **the exact error you are hunting is hidden.** [measured] the effect is
+  large and in the expected direction:
+
+| CV scheme | macro-AP | micro-AP | micro-F1@0.5 | macro-F1@0.5 |
+|---|---|---|---|---|
+| **`GroupKFold` on dup clusters** | **0.9384** | **0.9751** | **0.9397** | **0.8807** |
+| Plain shuffled `KFold` | 0.9338 | 0.9807 | 0.9488 | 0.8944 |
+
+  Ungrouped folds inflate micro-F1 by **+0.91pp** and micro-AP by **+0.56pp** — pure duplicate
+  leakage. (Macro-AP moves the other way because the leakage concentrates in the large template
+  clusters, which are head-service rows.)
+
+- **Runtime [measured]: 113 s** for 5 folds × 20 services × 4,622 rows, single machine, no GPU.
+
+**Two required metrics fall out of tier 2 for free**, and both must be reported (§6.1):
+
+- **ΔA — the text-pipeline delta.** Same labels, same folds, raw text versus Phase-1 text.
+  [measured] macro-AP **0.9351 → 0.9384 (+0.33pp)**, micro-F1 **0.9335 → 0.9397 (+0.62pp)**.
+  This is a **GPU-free proxy for the B0-vs-B1 rung** of the §5.2 ladder, available in minutes
+  instead of hours. It does not replace the encoder ablation; it tells you early whether the text
+  pipeline is helping or hurting.
+- **ΔB — the label-noise delta.** Same text, folds fixed, tier-3-flagged rows dropped from the
+  **training** folds only, evaluated on **untouched** held-out folds. The evaluation set must not
+  be cleaned, or you are measuring that you deleted the hard examples rather than that you
+  removed noise. [measured, approximate — see §9.7] macro-AP **0.9381 → 0.9302 (−0.79pp)**,
+  micro-F1 **0.9403 → 0.9406 (flat)**.
+
+  **Read that result carefully, because it is the most useful negative result in this document.**
+  On this corpus, removing the rows confident learning flags makes the model *worse*, and worse
+  specifically on the macro metric — i.e. on the rare services. The flagged rows are not noise;
+  they are hard-but-correct examples, which is exactly what you would expect from a fixture whose
+  labels were author-assigned and internally consistent. **A pipeline that auto-dropped
+  cleanlab's flags would have degraded the corpus and passed every gate.** Hence §4.3.1.
+
+**Tier 3 — cleanlab, with the correct multi-label API.** Verified against
+[cleanlab 2.9.0 docs](https://docs.cleanlab.ai/stable/cleanlab/multilabel_classification/index.html)
+(Apache-2.0, Python ≥ 3.10) and run locally at that version:
+
+| Purpose | Function | Notes |
+|---|---|---|
+| Flag rows | `cleanlab.multilabel_classification.filter.find_label_issues(labels, pred_probs, return_indices_ranked_by=None, …)` | `labels` is an **iterable of iterables of class indices** (`[[1,2],[1],[0],…]`), **not** a binary matrix; `pred_probs` is `(N, K)`. Returns a boolean mask by default, or indices ranked by `self_confidence` / `normalized_margin` / `confidence_weighted_entropy` |
+| Per-service flags | `…filter.find_multilabel_issues_per_class(labels, pred_probs)` | needed for the rare-tail guard below |
+| Rank rows | `…rank.get_label_quality_scores(labels, pred_probs, method='self_confidence', aggregator_kwargs={'method':'exponential_moving_average','alpha':0.8})` | one score per row; `…get_label_quality_scores_per_class` returns K arrays |
+| Corpus-level | `…dataset.common_multilabel_issues`, `rank_classes_by_multilabel_quality`, `overall_multilabel_health_score`, `multilabel_health_summary` | these are the **taxonomy diagnostics**, and they are more valuable here than the per-row flags |
+
+> **The wrong entry point is `cleanlab.filter.find_label_issues`.** That is the multi-class API;
+> it expects one integer label per example and will either raise or silently mis-handle a
+> multi-label target. Use the `multilabel_classification` namespace.
+
+[measured] on this corpus, tier 2 probabilities into cleanlab 2.9.0:
+
+| Selector | Rows | % of 4,622 |
+|---|---|---|
+| `find_label_issues` mask | **95** | 2.06% |
+| `get_label_quality_scores < 0.20` | 126 | 2.73% |
+| `< 0.30` | 313 | 6.77% |
+| `< 0.50` | 670 | 14.50% |
+| **Union of mask and score < 0.20 (the recommended selector)** | **161** | **3.48%** |
+
+Per-service flag counts [measured] are the interesting output — they read as a taxonomy report,
+not as a list of mistakes:
+
+`console-ui` **25** · `networking` 17 · `compute` 10 · `auth` 6 · `api-gateway` 6 · `billing` 6 ·
+`notifications` 6 · `cdn` 4 · `integrations` 4 · `managed-redis` 3 · `access-control` 2 ·
+`dns` 2 · `terraform-provider` 2 · `logging` 1 · `managed-postgres` 1 · `subscriptions` 1 ·
+`backups` 0 · `message-queue` 0 · `monitoring` 0 · `object-storage` 0
+
+And `common_multilabel_issues` gives the *direction*: `networking` is flagged 17 times as
+"in given label, not in suggested" and **0** times the other way; `console-ui` is flagged **13
+one way and 12 the other**. A class that is wrong in both directions is the signature of genuine
+definitional overlap rather than noise — which is precisely §2.8's `console-ui` problem,
+recovered automatically.
+
+**Cleanlab's assumptions, stated honestly:**
+
+- **Class-conditional noise.** Confident learning estimates the joint distribution of noisy and
+  true labels under the assumption that flips depend on the true class (JAIR 2021). Ambiguity
+  that depends on the *text* rather than on the class violates this. It is why tier 5 exists.
+- **Out-of-sample probabilities are required.** The documentation is explicit that scores are
+  "most accurate when computed based on out-of-sample `pred_probs`". In-sample probabilities make
+  every row look clean.
+- **Rare classes are fragile.** `find_label_issues` takes `min_examples_per_class=1` by default,
+  so it will happily prune a class down to one example. [measured] it flags **2 of
+  `terraform-provider`'s 15 positives (13%)** and 4 of `cdn`'s 38 (11%). Classifier spec §2.8
+  says a service below ~50 positives cannot be learned or evaluated reliably; letting an
+  automated tier erode those further is unrecoverable. **Guard: any flag on a service with < 50
+  positives routes to a human (rule R2, §4.3.10) and is never auto-applied.**
+- **Tier 3 is complementary to tier 1, not a superset.** [measured] only **27 of the 95** flagged
+  rows sit in a duplicate group of size > 1. The tiers find different things and both are worth
+  running.
+
+#### 4.3.4 Tier 4 — embedding kNN agreement, and the taxonomy diagnostic
+
+**Per-row signal (weak).** Embed the Phase-1 text with a checkpoint from the family the
+classifier will use (`intfloat/multilingual-e5-base`, or `-small` for speed — classifier spec
+§4.3), take the k = 10 nearest neighbours by cosine, **excluding neighbours in the same
+near-duplicate cluster**, and compute
+`knn_disagreement = 1 − mean_j Jaccard(S_i, S_j)`.
+
+[measured — TF-IDF character-cosine proxy, since I did not download an encoder for this spec;
+the embedding version will differ and must be re-measured]: median disagreement 0.550, p90 0.800,
+p99 0.950; **141 rows at ≥ 0.90, 56 at ≥ 0.95, 23 at 1.00** (no neighbour shares any label).
+Overlap with tier 3 at the ≥ 0.95 cut is **22 of 56**.
+
+**Routing rule, and it is deliberately timid: a kNN disagreement alone never routes a row.** It
+only corroborates — a row flagged by tier 3 *and* isolated in embedding space is a stronger
+candidate and sorts higher in the queue. Rationale: the measure has no null model, the threshold
+is arbitrary, and the k = 10 neighbourhood of a rare service is mostly other services by
+construction. [measured] 34 of the 56 are marginal-only rows that tier 3 did not flag; those go
+into the report, not the queue.
+
+**Corpus-level diagnostic (strong, and the real reason this tier exists).** Project the
+embeddings with UMAP, colour by service, and **report it once per snapshot as an image plus a
+neighbour-purity table** (for each service, the fraction of its rows whose k nearest neighbours
+carry that service). Two services whose regions interleave are evidence that they should be
+merged or that the guideline is underspecified — a classifier spec §6.5-class finding that goes
+to the product owner, not to a reviewer. This is **not** a per-row filter and must never be used
+as one: UMAP's low-dimensional geometry is not a faithful metric and no row should be touched on
+the basis of where it lands in a projection.
+
+Expected reading on this corpus [estimate]: `auth`/`access-control` and `console-ui`/everything
+should interleave, matching the 17.5% and 637-row co-occurrence measurements in §2.8. If they do
+not, the embedding is not capturing the distinction and the classifier will not either.
+
+#### 4.3.5 Tier 5 — what the LLM judge is scoped to
+
+The judge runs on the **union of four strata, and nothing else**:
+
+| Stratum | Definition | Rows [measured] |
+|---|---|---|
+| **S1 — cheap-tier flags** | tier 1 conflicts (queued grades) ∪ tier 3 selector | ~14 ∪ 161 |
+| **S2 — ambiguous-pair swap candidates** | row carries exactly one member of an ambiguous pair, and the tier-2 out-of-sample probability of the *other* member both exceeds the carried one and exceeds 0.5 | **6** (`auth`/`access-control` 3, `integrations`/`notifications` 1, `cdn`/`networking` 2) |
+| **S3 — `console-ui` candidates** | carries `console-ui` with `P < 0.30`, or lacks it with `P > 0.70` | **65** |
+| **S4 — random audit** | 2% of labelled rows, drawn by seeded hash, judged regardless of any flag | **92** |
+| **Union** | | **288 rows = 6.2% of labelled rows** |
+
+S2 and S3 are what §2.8's "59.1% of rows touch an ambiguous family" becomes once it is made
+*measurable*: instead of routing 2,730 rows because they contain an ambiguous service, route the
+71 where a model trained on the corpus disagrees with the stored label in the specific direction
+the taxonomy is known to be weak. **This is the single largest reduction in the revised design**,
+and it is only possible because tier 2 exists.
+
+S4 is not optional. Without an unflagged stratum there is no way to estimate the judge's
+behaviour on rows the cheap tiers considered clean, and therefore no way to estimate the cascade's
+recall.
+
+#### 4.3.6 Verdict schema and the constrained-adjudication pattern
+
+The pattern is [llm-fallback-policy §4.1 constrained adjudication](./llm-fallback-policy.md),
+reused rather than reinvented, applied to stored labels instead of to a classifier shortlist. The
+shortlist is the row's existing `services` set; the verdict is accept/reject per candidate; the
+output is schema-constrained with an `enum` over service names, so an invalid service name is not
+a failure mode that has to be handled. Requiring an `evidence` span is a grounding constraint and
+gives reviewers something to audit — same argument, same schema, one addition.
 
 The general caution from
 [Zheng et al., "Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena" (NeurIPS 2023)](https://arxiv.org/pdf/2306.05685)
-applies and is why §4.3.5 exists: LLM judges exhibit **position bias, verbosity bias and
-self-enhancement bias**, and the paper's headline agreement-with-humans result is for *pairwise
-preference* judging, not for taxonomy label adjudication. **Do not import their agreement number
-as an expectation for this task.** Measure ours on the pilot.
-
-#### 4.3.2 Verdict schema
+applies and is why §4.3.9 shuffles candidate order: LLM judges exhibit **position bias, verbosity
+bias and self-enhancement bias**. That paper's headline agreement-with-humans result is for
+*pairwise preference* judging, not for taxonomy label adjudication. **Do not import their
+agreement number as an expectation for this task.** Measure ours on the pilot.
 
 ```json
 {
@@ -1067,7 +1404,7 @@ as an expectation for this task.** Measure ours on the pilot.
   `basis: no_support_in_text`. This is what makes a rejection reviewable in seconds instead of
   minutes, and it is the difference between a 2.5-minute and a 6-minute human queue item.
 
-#### 4.3.3 The three hard cases the taxonomy deliberately contains
+#### 4.3.7 The three hard cases the taxonomy deliberately contains
 
 The judge prompt carries the **annotation guideline's own definitions** (classifier spec §2.2)
 plus an explicit decision rule per confusable pair. Definitions alone are what produced the
@@ -1101,10 +1438,15 @@ are largely disjoint in practice.
 > the console correctly displays a backend failure, the label is the backend component **only**.
 > **Guard:** a judge applying this rule strictly would strip `console-ui` from a large share of
 > the 637 co-labelled rows. That may be right and it may be the model over-applying a rule it
-> was just handed. §4.3.6 caps it: **no service's reject rate may exceed 15% [estimate — calibrate
-> on the pilot] without explicit human sign-off on that service's whole reject list.**
+> was just handed. §4.3.10 caps it: **no service's reject rate may exceed 15% [estimate —
+> calibrate on the pilot] without explicit human sign-off on that service's whole reject list.**
+> **Corroboration [measured]:** cleanlab independently flags `console-ui` more than any other
+> service (25 rows) and flags it in *both* directions (13 given-not-suggested, 12
+> suggested-not-given). Two instruments agreeing that this service is the corpus's weak point,
+> from completely different evidence, is the strongest signal in the pipeline that the *guideline*
+> needs work rather than the labels.
 
-#### 4.3.4 The missing-label direction
+#### 4.3.8 The missing-label direction
 
 The judge can only reject what is present. The missing-label problem is real and runbook §3
 already identifies its consequence: labels with reliable positives and **unreliable negatives**,
@@ -1116,7 +1458,7 @@ adding.**
 | Option | Effect on the label set | Effect on provenance | Verdict |
 |---|---|---|---|
 | Auto-apply proposals as positives | recall of labels ↑ | **every added positive is LLM-authored** — model provenance, and the exact distillation failure of proposal §3 | **No** |
-| Route proposals to the human queue | recall ↑ where a human agrees | `human_after_judge` (anchored, §4.3.8) | Yes, for high-value cases only (§4.3.6) |
+| Route proposals to the human queue | recall ↑ where a human agrees | `human_after_judge` (anchored, §4.3.13) | Yes, for high-value cases only (§4.3.10) |
 | **Mask the proposed service out of the negative set** | recall unchanged; the model is simply not told "this is a negative" | the *label* is unchanged, so provenance is unchanged | **Recommended default** |
 | Ignore proposals | nothing | nothing | The fallback if the mask ablation shows no gain |
 
@@ -1129,6 +1471,12 @@ masking cannot lower label precision because it adds no positives; it can only r
 gradient pressure that pushes a genuinely-correct service down. The cost is a slightly weaker
 negative signal, which is exactly what the ablation measures.
 
+**Tier 1 produces the same masking signal for free.** A `nested` conflict group (§4.3.2) is a
+missing-label observation with no model in it at all: two duplicate texts, one carrying `{auth,
+api-gateway}` and one carrying `{auth, api-gateway, object-storage}`. Mask `object-storage` out
+of the smaller row's negatives. [measured] this fires on 4 rows here; on a real corpus it should
+be the dominant source of masking, and it is strictly better evidence than a judge proposal.
+
 **The ablation (4 arms, 5 seeds, identical everything else, evaluated once on the blind gold
 test set):** (i) Phase-1 labels; (ii) + judge rejections applied; (iii) (ii) + proposals masked;
 (iv) (ii) + proposals applied as positives. Arm (iv) is included **only** as a diagnostic and is
@@ -1136,33 +1484,50 @@ test set):** (i) Phase-1 labels; (ii) + judge rejections applied; (iii) (ii) + p
 set — llm-fallback-policy §5. If (iv) wins by a lot, that is a finding about label recall to
 report to the annotation effort, not a licence to ship it.
 
-#### 4.3.5 Self-consistency, and reconciling it with the ≤1-call budget
+#### 4.3.9 Self-consistency, and the call budget after the cascade
 
-**The ≤1-call constraint is scoped per phase, and I am stating that explicitly rather than
-assuming it.** A judge call is a second LLM call per row; a 2-of-3 self-consistency scheme is a
-second, third and fourth. If the constraint were global the judge could not exist at all, which
-is clearly not the brief's intent.
+**The ≤1-call-per-row constraint is scoped per phase, and I am stating that explicitly rather
+than assuming it.** A judge call is a second LLM call for a row that Phase 2 already saw; a
+2-of-3 self-consistency scheme is a third and fourth. If the constraint were global the judge
+could not exist at all, which is clearly not the brief's intent. After the cascade the question
+is close to moot: the judge sees **6.2% of labelled rows**, so Phase 3's *corpus-wide* call rate
+is **0.08 calls per labelled row**, an order of magnitude under the Phase-2 budget.
 
-That said, 3× on every row is wasteful, so:
+**Escalating self-consistency, over the §4.3.5 strata only.**
 
-**Escalating self-consistency.**
-
-1. **One call per row** with the candidate services in stored order. [measured] 4,622 rows have
-   ≥1 service → 4,622 calls.
-2. **Escalate to two more calls, with the candidate order shuffled**, only for rows where the
-   first call produced ≥1 `reject` or ≥1 `proposed_addition`.
-3. Decide: **3-of-3 unanimous reject → auto-apply. 2-of-3 → human queue. 1-of-3 → ignore**,
-   and log it.
+1. **One call per judged row** with the candidate services in stored order.
+   [measured] 288 rows → **288 calls**.
+2. **Escalate to two more calls with the candidate order shuffled**, only where the first call
+   produced ≥1 `reject` or ≥1 `proposed_addition`. Because the pool is pre-filtered to
+   *suspicious* rows, the escalation rate is much higher than it would be corpus-wide —
+   [estimate] 40–60% rather than 10–20%.
+3. Decide: **3-of-3 unanimous reject → eligible for auto-apply (subject to §4.3.10 R1–R7).
+   2-of-3 → human queue. 1-of-3 → ignore**, and log it.
 
 Order shuffling rather than temperature is the correct mechanism and llm-fallback-policy §4.1
 already says why: temperature is rejected with a 400 on current models, so sampling variance has
 to come from varying the prompt. Shuffling is also the direct mitigation for the **position
 bias** documented by Zheng et al.
 
-**[estimate]** at a 10–20% escalation rate: 4,622 + (0.15 × 4,622 × 2) ≈ **6,000 calls**, or
-**1.30 calls per labelled row**. Cost at the §4.2.5 rates with a larger prompt (the ~20 service
-definitions are the cached prefix, ~2,000 tokens): **≈ $30–45** [estimate] for the full corpus.
-Again, cost is not the constraint.
+**Call count and cost, revised [measured rows, estimated escalation]:**
+
+```
+judged rows                                   288   [measured]
+first-pass calls                              288
+escalated rows @ 50%                          144   [estimate]
+escalation calls (2 each)                     288
+------------------------------------------------------
+total Phase-3 LLM calls                     ~ 576   → but see below
+```
+
+At the more conservative 30% escalation rate the total is ~460; at 60% it is ~634. **Plan on
+~375–600 calls**, against the first revision's ~6,000 — a **10–16× reduction**. Cost at the
+§4.2.5 rates with the ~2,000-token cached service-definition prefix: **≈ $2–4** [estimate] for
+the whole corpus, down from $30–45.
+
+**The cost saving is not the point and should not be argued as one.** $30 was never a constraint.
+The point is that **576 model opinions carry an order of magnitude less contamination surface
+than 6,000**, and that the rows the judge does see were selected by instruments that carry none.
 
 **On fusing Phases 2 and 3 into one call.** The argument *for* is real: it halves the calls, the
 model sees the ticket once, and evidence spans could be shared between the two jobs. **The
@@ -1174,15 +1539,19 @@ argument against is decisive and there are two of them:**
    fused call cannot both run and not run on the same rows. Splitting the fused call by row
    population reintroduces two prompts, at which point nothing was fused.
 2. **Fusion destroys the ablation.** With one call you cannot attribute a change to text cleaning
-   or to label repair, so B2 and B3 in §3 collapse into B4 and the decision rules in §4.2.4 and
-   §4.3.4 have nothing to compare.
+   or to label repair, so B2/B2b and B3 in §3 collapse into B4 and the decision rules in §4.2.4
+   and §4.3.8 have nothing to compare.
 
 There is a third, softer reason: a model asked to clean text and judge labels in one pass can
 rationalise one to fit the other. Keeping them independent keeps the two signals independent.
 
+A fourth reason arrives with the cascade: **the two phases now run on different-sized
+populations.** Phase 2 sees every row; Phase 3 sees 6.2% of them. Fusing would drag the judge
+onto 4,622 rows purely to keep the call count down, which is the opposite of what §4.3.0 is for.
+
 **Do not fuse.**
 
-#### 4.3.6 The routing rule — which rows go to a human
+#### 4.3.10 The routing rule — which rows go to a human
 
 A row is routed to the human-supervision queue if **any** of the following fires. Rules are
 ordered by expected volume and each carries its measured or estimated population.
@@ -1192,46 +1561,84 @@ ordered by expected volume and each carries its measured or estimated population
 | **R1** | Reject on a row where `|S| = 1` — applying it would empty the label set | An emptied row silently leaves the training corpus; that is too consequential for an unreviewed model verdict | [measured] 1,569 rows have `|S| = 1` (34% of labelled rows) |
 | **R2** | Reject on a service in the rare tail (`terraform-provider` 15, `message-queue` 31, `cdn` 38, `dns` 41, `managed-redis` 98) | Classifier spec §2.8: below ~50 positives a service cannot be learned or evaluated. Losing rare positives is unrecoverable and cannot be detected by any aggregate metric | [measured] 212 rows carry a rare-tail service |
 | **R3** | 2-of-3 self-consistency (not unanimous) | The judge is not sure; a human is the tiebreak | [estimate] ~40% of escalated rows |
-| **R4** | `proposed_additions` with ≥2 entries, or one that would take `|S|` to 5 (violating the `≤4` contract) | Aggressive expansion is either a real missing-label finding or a hallucinating judge; both need eyes | [estimate] ~1–2% of rows |
-| **R5** | A "swap" within an ambiguous pair: reject `auth`, propose `access-control` (or the reverse), same for `monitoring`/`logging`, `console-ui`/component | These are exactly the distinctions the taxonomy admits are contested; a model resolving them unilaterally is out of its authority | [measured] 2,730 rows touch an ambiguous family, but only the *flip* subset routes |
-| **R6** | Any service whose corpus-wide reject rate exceeds **15%** [estimate] | A systematic prompt or guideline problem, not 700 independent label errors. **The whole service's reject list is held** pending sign-off | Whole-service, rare |
-| **R7** | Random **2%** audit sample regardless of verdict | The only way to measure the auto-applied arm's error rate. **Non-negotiable** — without it, the auto-apply path is unmeasured | [measured] 92 rows |
+| **R4** | `proposed_additions` with ≥2 entries, or one that would take `|S|` to 5 (violating the `≤4` contract) | Aggressive expansion is either a real missing-label finding or a hallucinating judge; both need eyes | [estimate] ~1–2% of judged rows |
+| **R5** | A "swap" within an ambiguous pair: reject `auth`, propose `access-control` (or the reverse), same for `monitoring`/`logging`, `console-ui`/component | These are exactly the distinctions the taxonomy admits are contested; a model resolving them unilaterally is out of its authority | [measured] the S2/S3 strata are **71 rows**, and only the *flip* subset of those routes |
+| **R6** | Any service whose reject rate over the judged pool exceeds **15%** [estimate] | A systematic prompt or guideline problem, not many independent label errors. **The whole service's reject list is held** pending sign-off | Whole-service, rare |
+| **R7** | Random **2%** audit sample regardless of verdict (stratum S4) | The only way to measure the auto-applied arm's error rate **and** the cascade's recall on rows the cheap tiers called clean. **Non-negotiable** | [measured] 92 rows |
+| **R8** | Tier-1 `disjoint` conflict, and tier-1 `partial` up to the 5-row cluster cap | Direct evidence, no model. These route whether or not the judge agrees — the judge's verdict is attached as context, not as a gate | [measured] ~14 rows |
 
 **Not routed:** `judge_ungrounded` verdicts (evidence not verbatim). Those are a pipeline defect,
 not a label question; discard the verdict, count it, and if the rate exceeds 2% fix the prompt
-(§6.2).
+(§6.2). Also not routed: tier-4 kNN disagreement on its own (§4.3.4), and tier-1 `nested`
+conflicts, which go to masking (§4.3.8).
 
-#### 4.3.7 Queue size and person-hours
+#### 4.3.11 Queue size and person-hours — revised for the cascade
 
-Arithmetic, all inputs either [measured] on the fixture or flagged [estimate]:
+The cascade changes this number substantially, and it supersedes the ~650-row / 46-hour figure in
+the first revision of this document and the reconciliation in
+[`finetuning-dataset-pipeline.md` §7.1](../proposals/finetuning-dataset-pipeline.md).
 
 ```
 labelled rows                                        4,622  [measured]
-(ticket, service) verdicts                           8,771  [measured]
 
-base reject rate on this fixture                    3–8%    [estimate]
-  (labels are author-assigned and internally consistent;
-   a real CatBoost-contaminated column would be 10–20%)
-  take 8%                                        → ~700 rejects
+TIER SELECTION (before any LLM call)
+  T1 conflicts: disjoint + capped partial + desc-dups    ~14  [measured]
+  T1 nested → masking, not queued                         ≤4  [measured]
+  T3 cleanlab (mask 95 ∪ quality<0.20 126)               161  [measured]
+  T4 kNN: corroborating only, 0 marginal routes            0  [measured, by rule]
+  S2 ambiguous-pair swap candidates                        6  [measured]
+  S3 console-ui candidates                                65  [measured]
+  S4 2% random audit                                      92  [measured]
+  ---------------------------------------------------------
+  union judged by the LLM                                288  = 6.2% of labelled rows
 
-unanimous 3-of-3 (auto-apply)               ~60%   → ~420   [estimate]
-2-of-3 → R3 queue                           ~40%   → ~280   [estimate]
-
-R1: rejects landing on |S|=1 rows      0.34 × 700 → ~240    (overlaps R3)
-R2: rejects on rare-tail rows          0.08 × 212 → ~17
-R4: ≥2 proposals or |S|→5                          → ~50–70 [estimate]
-R5: ambiguous-pair swaps                           → ~80–120[estimate]
-R7: 2% random audit                                → 92     [measured]
-
-union, de-overlapped                               → ~550–750 rows [estimate]
-midpoint                                           → ~650 rows = 14% of labelled rows
+QUEUE (after judging)
+  reject rate on a pre-filtered pool              40–60%     [estimate — the pool is
+                                                              selected to be suspicious]
+  take 50% of 288                                    ~144 rows with ≥1 reject/proposal
+  of those, 3-of-3 unanimous            ~60%          ~86  auto-apply-eligible
+  of those, 2-of-3 → R3                 ~40%          ~58  queued
+  R1 (|S|=1 rejects, 34% of rows)                     ~49  (overlaps R3)
+  R2 (rare-tail rejects)                              ~10
+  R4 (aggressive proposals)                            ~8
+  R5 (ambiguous swaps, from the 71-row S2∪S3 pool)    ~30
+  R7 (2% audit, queued regardless)                     92  [measured]
+  R8 (tier-1 conflicts, queued regardless)             14  [measured]
+  ---------------------------------------------------------
+  union, de-overlapped                            ~180–230 rows [estimate]
+  midpoint                                            ~200 rows = 4.3% of labelled rows
 ```
 
-**Person-hours:** ~2.5 min per item — the evidence span makes most decisions fast, and R5 swaps
-are the slow ones. **650 × 2.5 min ≈ 27 person-hours** [estimate]. Add the Phase-3 prompt
-calibration pilot (200 human-adjudicated verdicts, ~8 h) and the per-phase pipeline validation
-samples (§6.5: 200 + 150 + 100 items, ~1.5 min each ≈ 11 h). **Total ≈ 46 person-hours**
-[estimate].
+**Person-hours, and this is the number that should appear in the proposal:**
+
+| Item | Volume | Rate | Hours |
+|---|---|---|---|
+| Human review queue | **~200 rows** [estimate] | 2.5 min | **8.3** |
+| Phase-3 prompt calibration pilot | 100 verdicts (reduced from 200 — the judged pool is only 288) | 2.5 min | 4.2 |
+| Phase-1 validation sample (§6.5) | 200 rows | 1.5 min | 5.0 |
+| Phase-2 validation sample (§6.5) | 150 rows | 1.5 min | 3.8 |
+| Phase-3 validation sample (§6.5) | 100 verdicts | 1.5 min | 2.5 |
+| Blocklist review (§6.5) | 149 entries, once per version | — | ~1.0 |
+| **Total** | | | **~25 person-hours** [estimate] |
+
+**Reconciliation with the two other documents.** The architecture doc costed the queue at
+600 rows × 75 s = 12.5 h; the first revision of this document costed 650 × 2.5 min = 27 h plus
+19 h of validation = 46 h; the proposal §7.1 split the difference at ~44 h. **All three are now
+superseded.** The rate stays at 2.5 min — that argument was about the *difficulty* of a queue
+item, not its count, and the cascade makes queue items *harder* on average, not easier, because
+the easy ones were filtered out by instruments that did not need a human. What changed is the
+count: **~200 rows, not 600–650.** The architecture doc's 600-row cap remains a sensible capacity
+control and is now comfortably non-binding.
+
+**Single figure for the proposal: ~25 person-hours, of which ~8 h is the review queue.**
+
+**Scaling caveat, and it is the one that matters for budgeting.** These counts come from a
+fixture whose labels are author-assigned and internally consistent — cleanlab flags 2.06% of
+rows. On a real corpus with a CatBoost-contaminated `services` column [estimate] the flag rate is
+**10–20%**, giving 460–920 tier-3 rows at the same corpus size, a judged pool of ~600–1,100, and
+a queue of **~400–700 rows ≈ 17–29 h**. **Do not commit a queue budget from this fixture.** Run
+tiers 1–3 on the real export first; they cost [measured] under four minutes of CPU and produce
+the exact number (open question P10).
 
 **This is in addition to the runbook §4.2 gold-set budget of ~70 person-hours, and it must not
 be taken out of it.** Four reasons, and the first alone settles it:
@@ -1254,9 +1661,49 @@ be taken out of it.** Four reasons, and the first alone settles it:
 **Priority statement, in case the budget is ever forced:** if only 70 hours exist, **spend all of
 it on the blind gold set and skip Phase 3 entirely.** The gold set is a prerequisite for
 concluding anything; the queue is an optimisation of training-label quality that improves a
-number you cannot yet measure.
+number you cannot yet measure. The cascade makes this trade-off less painful than it was — tiers
+1–3 cost four minutes of CPU and zero person-hours, so **even under a zero-human budget you can
+run them and get the taxonomy diagnostics** (§4.3.3, §4.3.4); you simply cannot act on the
+per-row flags.
 
-#### 4.3.8 The contamination fence — mechanics
+#### 4.3.12 When to drop the LLM judge entirely
+
+This is a live option, not a rhetorical one, and it should be decided on a measurement rather
+than on taste. The cheap tiers carry no contamination cost; the judge carries a permanent one
+(§4.3.13). So the judge has to earn its place.
+
+**Measure this on the pilot (100 human-adjudicated verdicts, §4.3.11):**
+
+- **`P_cheap`** — precision of the cheap tiers: of the rows tiers 1+3 flagged, the fraction a
+  human agrees are genuinely mislabelled.
+- **`P_judge|cheap`** — of the rows tiers 1+3 flagged, the fraction on which the judge's verdict
+  matches the human's.
+- **`Yield_judge`** — of the rows the judge flags in the **S4 random audit stratum** (which the
+  cheap tiers did *not* flag), the fraction a human agrees are genuinely mislabelled. This is the
+  judge's *marginal recall*, and it is the number that decides the question.
+
+**The decision rule:**
+
+| Condition | Reading | Action |
+|---|---|---|
+| `P_cheap ≥ 0.80` **and** `Yield_judge < 0.10` | The cheap tiers are precise and the judge finds little they missed. Its verdicts are mostly re-deriving conclusions a human could reach from the flag alone | **Drop the LLM judge.** Route tier-1 and tier-3 flags straight to humans. The queue grows by the ~30 R5 rows the judge would have triaged, and the corpus gains zero model-provenance rows |
+| `P_cheap < 0.50` | The cheap tiers are noisy; humans would spend most of their time rejecting false alarms | **Keep the judge as a triage filter.** This is its strongest case: it reduces human load rather than adding opinions |
+| `Yield_judge ≥ 0.10` | The judge finds real errors the cheap tiers structurally cannot — most likely the taxonomy-ambiguity class of §4.3.0 point 4 | **Keep the judge**, scoped to S2/S3 plus the cheap-tier residual, as specified |
+| Ambiguous / pilot too small to separate | | **Keep the judge but disable auto-apply**, so every verdict is advisory to a human and no model-provenance label is created |
+
+**My prior, for what it is worth, and it is a prior not a finding:** on this fixture I expect
+`P_cheap` to be *low* — [measured] dropping the flagged rows hurt macro-AP by 0.79pp, which is
+consistent with the flags being hard-but-correct rows rather than errors. That argues for
+*keeping* the judge as a triage filter here. On a real CatBoost-contaminated corpus I expect
+`P_cheap` to be much higher and the judge's marginal yield to be concentrated entirely in the
+ambiguous pairs. **Both readings are testable with 100 human decisions; make them before
+committing to the judge.**
+
+**What is not negotiable either way:** the taxonomy diagnostics (§4.3.3 `common_multilabel_issues`,
+§4.3.4 UMAP neighbour purity) ship regardless. They cost nothing, they need no human, and they
+answer a question — "is this taxonomy learnable?" — that no per-row instrument answers.
+
+#### 4.3.13 The contamination fence — mechanics
 
 **The rule (llm-fallback-policy §5): the LLM must never touch the gold set — not as annotator,
 not as pre-annotator, not as a pre-filter on what gets annotated.** Here is exactly how that is
@@ -1275,10 +1722,32 @@ GOLD SAMPLE DRAWN  — runbook §4.1, seeded hash, stratified, blind
    ↓
 gold_ids.json  FROZEN, content-hashed
    ↓
-Phase 3  input row set := all_rows \ gold_ids      ← hard assertion
+Phase 3, ALL TIERS  input row set := all_rows \ gold_ids   ← hard assertion
+   ├─ tier 1  conflicts
+   ├─ tier 2  TF-IDF + grouped CV  ← trained on the non-gold pool only
+   ├─ tier 3  cleanlab
+   ├─ tier 4  kNN + UMAP
+   ├─ tier 5  LLM judge
+   └─ tier 6  human queue
 ```
 
-Four mechanical requirements:
+**The fence covers the whole cascade, not just the LLM.** llm-fallback-policy §5 names the LLM
+because that is the document's subject, but the *principle* it protects — a model must not choose
+what a human annotates — applies to any model, and cleanlab's ranking is exactly such a choice.
+Extending the fence costs nothing: the cheap tiers have no reason to look at gold rows, and
+excluding them removes a whole class of argument about whether tier 3 "counts".
+
+Two narrow exceptions, both after the fact and neither feeding sampling:
+
+- **Tier 1 may be run over the *adjudicated* gold set as a data-quality report to the annotation
+  lead.** "Two byte-identical tickets received different labels from your annotators" is a
+  legitimate finding about annotation quality, it involves no model, and it arrives after
+  adjudication so it cannot influence what was annotated.
+- **Tier 2 may be *evaluated* on the gold set** — that is just the classifier spec §3 baseline
+  doing its normal job. It must be **trained** on the non-gold pool only, which is the same rule
+  every other model in the project follows.
+
+Five mechanical requirements:
 
 1. **A hard assertion, not a filter.** The judge stage asserts
    `set(input_ids) ∩ set(gold_ids) == ∅` and **aborts the run** on violation. A filter that
@@ -1292,10 +1761,18 @@ Four mechanical requirements:
    proposals are stored in a separate table from the annotation payload. Annotators for the gold
    set see title + description + priority only (classifier spec §2.2). The queue reviewers are a
    *different task with a different UI* and their output carries a different provenance value.
-4. **Sampling independence.** The judge must not influence *which* rows get annotated. The gold
-   sample is drawn by seeded hash over strata that contain no judge-derived field. Concretely:
+4. **Sampling independence.** No Phase-3 tier may influence *which* rows get annotated. The gold
+   sample is drawn by seeded hash over strata that contain no Phase-3-derived field. Concretely:
    `dup_cluster_id`, `lang_primary`, `created_at` month, and cardinality are permitted strata;
-   `judge_verdict`, `judge_disagreement`, and `is_unactionable` (Phase-2-derived) are **not**.
+   `judge_verdict`, `judge_disagreement`, **`cleanlab_flag`, `label_quality_score`,
+   `knn_disagreement`**, and `is_unactionable` (Phase-2-derived) are **not**.
+   `dup_cluster_id` is permitted and `conflict_grade` is **not** — the first is a property of the
+   text, the second is a property of the labels, and stratifying on the second would bias the
+   test set toward contested rows.
+5. **Tier-2 folds respect the fence.** The `GroupKFold` in §4.3.3 is computed over the non-gold
+   pool. If gold rows were included, their out-of-sample probabilities would be produced by a
+   model trained on the rest of the corpus, which is fine for evaluation but would then tempt
+   someone to run cleanlab over them. Keep the pool clean and the temptation does not arise.
 
 **Provenance markers.** Every row carries a structured `label_provenance`:
 
@@ -1305,7 +1782,17 @@ Four mechanical requirements:
                    llm_judge_confirmed | llm_judge_modified | catboost | transformer",
   "judge_touched": true,
   "judge_run_id": "...", "judge_model": "...", "judge_prompt_version": "...",
-  "verdict_ids": ["..."], "changed_at": "...", "reviewer_id": "... | null"
+  "verdict_ids": ["..."], "changed_at": "...", "reviewer_id": "... | null",
+
+  "cascade": {
+    "conflict_grade": "identical | nested | partial | disjoint | null",
+    "dup_cluster_id": "...",
+    "cleanlab_flagged": false,
+    "label_quality_score": 0.79,
+    "knn_disagreement": 0.55,
+    "selected_by": ["T1", "T3", "S2", "S3", "S4"],
+    "tier2_run_id": "...", "cleanlab_version": "2.9.0"
+  }
 }
 ```
 
@@ -1313,6 +1800,13 @@ Four mechanical requirements:
 Confirmation is not neutral: a confirmed row has passed through a model's opinion, and if we ever
 discover the judge was systematically wrong about a service, we need to find every row it looked
 at — not just the ones it changed.
+
+**The `cascade` block is diagnostic metadata, not provenance.** A `cleanlab_flagged: true` row
+whose label was never changed has exactly the provenance it started with — a routing signal is
+not an opinion about the label, and treating it as one would disqualify rows for no reason. The
+block exists so that (a) the queue can be re-derived without re-running the tiers, (b) a later
+discovery that tier 3 was mis-configured can be traced to the rows it affected, and (c) the
+§6.1 metrics can be sliced by which tier selected a row.
 
 **A row whose label was changed on the judge's advice is model provenance and can never be
 Case A. Confirmed, and the reasoning is not close.** Case A is defined
@@ -1322,7 +1816,7 @@ LLM output into the trustworthy-label pool and reproduce, with a second model, e
 feedback loop proposal §3 exists to escape. Concretely:
 
 - `llm_judge_modified` → **excluded from val/test unconditionally.** Usable in training at
-  reduced weight, subject to the §4.3.4 ablation, and reported as its own slice.
+  reduced weight, subject to the §4.3.8 ablation, and reported as its own slice.
 - `human_after_judge` (a reviewer agreed with a judge proposal) → **also excluded from val/test.**
   This is the subtle one and it is worth being firm about: the reviewer saw the model's opinion,
   so this is anchored annotation, which classifier spec §2.2 and llm-fallback-policy §5 both
@@ -1345,27 +1839,41 @@ Classifier spec §5.3 already requires an identical data snapshot, splits, PII r
 construction, thresholds, decode and metric code across arms. The pipeline adds four artifacts
 that must be pinned identically across every ablation arm, or the comparison is meaningless:
 
-`preprocess_version` · `blocklist_hash` · `detector_inventory_version` ·
-`gold_ids_hash`, plus `judge_prompt_version` and `judge_model` for arms that use Phase 3.
+`preprocess_version` · `blocklist_hash` · `detector_inventory_version` · `gold_ids_hash`, plus
+`judge_prompt_version` and `judge_model` for arms that use tier 5, and **`tier2_run_id`,
+`cleanlab_version` and the tier-3 selector definition** for arms that use the cascade. A cleanlab
+minor-version bump changes which rows are flagged and therefore which rows a human saw; it is a
+snapshot-invalidating change.
 
 Every one of these goes in the snapshot manifest and in `model_card.md`.
 
 ### 5.2 The ablation ladder
 
-One table, five arms, one decision rule per rung. Same 5-seed list throughout (10 seeds if the
-usable label count lands under 5,000 — classifier spec §5.4). Reported as **mean ± sd**;
-a single-seed number is not a result.
+Same 5-seed list throughout (10 seeds if the usable label count lands under 5,000 — classifier
+spec §5.4). Reported as **mean ± sd**; a single-seed number is not a result.
 
 | Rung | Arm | Compared to | Ship the rung if |
 |---|---|---|---|
 | 0 | B0 raw passthrough | — | (reference floor) |
 | 1 | B1 Phase-1 only | B0 | any improvement; if none, investigate before proceeding |
 | 2 | B3 Phase 1 + Phase-2-mined rules | B1 | **≥ 1.0pp mean val `R@P90` and non-overlapping seed intervals** (§4.2.4) |
-| 3 | B2 Phase 1 + judge rejections | B1 | ≥ 1.0pp, same test |
+| 3 | **B2 Phase 1 + cheap-tier label repair** (tier-1 conflicts applied, tier-1/tier-5-free masking, human decisions on the tier-1 queue) | B1 | ≥ 1.0pp, same test |
 | 3b | B2 + proposals masked | B2 | ≥ 0.5pp; masking is nearly free, so a smaller bar is justified |
-| 4 | B4 full | max(B2, B3) | ≥ 1.0pp over the better single phase, else ship the single phase |
+| 3c | **B2b = B2 + LLM judge** | **B2** | ≥ 1.0pp **over B2, not over B1**. This is the rung that decides §4.3.12 |
+| 4 | B4 full | max(B2b, B3) | ≥ 1.0pp over the better single phase, else ship the single phase |
 
-Diagnostic-only, never shippable: proposals applied as positives (§4.3.4 arm iv).
+Rung 3c is the addition that the cascade forces and it is the one most likely to be skipped.
+**Comparing the judge against B1 rather than against B2 would credit the judge with everything
+the free tiers achieved** — a version of the same attribution error §4.2.4 avoids for Phase 2.
+
+Diagnostic-only, never shippable: proposals applied as positives (§4.3.8 arm iv).
+
+**The cheap pre-check that comes first.** Before any GPU touches this, run the §4.3.3 tier-2
+model over each text variant and compare out-of-sample macro-AP. [measured] on this fixture the
+B0→B1 text delta is **+0.33pp macro-AP / +0.62pp micro-F1**, obtained in under four minutes of
+CPU. That is not a substitute for the encoder ladder — a linear model over character n-grams may
+respond differently to preprocessing than a fine-tuned transformer — but a variant that makes the
+linear model *worse* is worth investigating before spending GPU hours on it.
 
 **All rungs are decided on validation.** The blind gold test set is scored **once per shipped
 candidate** (classifier spec §6.4). An ablation ladder is a hyperparameter search over
@@ -1382,13 +1890,20 @@ I state the inputs; `dataset-pipeline-architecture.md` owns the cost model and t
 | MinHash, 2 signatures | **2.1 ms/row/signature** [measured] | 21 s | 3.5 min |
 | Language ID | ~1 ms/row [estimate] | 5 s | 50 s |
 | Phase 2 | 1 call/row, ~1,900 in / ~200 out, cacheable prefix | ~$19 [estimate] | ~$190 [estimate] |
-| Phase 3 | ~1.30 calls/labelled row, ~2,100 in / ~150 out | ~$30–45 [estimate] | ~$300–450 [estimate] |
-| Human queue | 2.5 min/item | ~27 h [estimate] | scales with reject count, not rows |
+| **P3 tier 1** — conflict grading over dup clusters | reuses §4.1.7 clusters; O(n) grouping | **< 5 s** [measured] | ~1 min |
+| **P3 tier 2** — TF-IDF + OvR LR, 5-fold `GroupKFold`, 20 services | **113 s** [measured], single machine, no GPU | **113 s** | ~25 min [estimate, superlinear in vocabulary] |
+| **P3 tier 3** — cleanlab 2.9.0 over `(N, 20)` probabilities | seconds | **< 10 s** [measured] | < 2 min |
+| **P3 tier 4** — embeddings + kNN + UMAP | encoder forward pass over the corpus | ~4 min [estimate, mE5-small INT8 at 61 tickets/s] | ~14 min |
+| **P3 tier 5** — LLM judge | **~375–600 calls** on 288 rows [measured rows], ~2,100 in / ~150 out, cached prefix | **~$2–4** [estimate] | ~$20–40 [estimate] |
+| **P3 tier 6** — human queue | 2.5 min/item | **~8 h** on ~200 rows [estimate] | scales with flag rate, not rows |
 
-The deterministic phases are free. The LLM phases cost less than a day of engineering time. **No
-part of this pipeline is cost-constrained**, which means every decision in it should be made on
-correctness and risk, not on budget — and any argument in a design review that starts with "to
-save on LLM calls" should be treated with suspicion.
+**The whole label-error cascade below the LLM costs about two minutes of CPU and zero dollars.**
+That is the fact that should govern the design review. The deterministic phases are free, the LLM
+phases now cost less than a lunch, and **no part of this pipeline is cost-constrained** — so every
+decision in it should be made on correctness, contamination risk and human time, not on budget.
+Any argument that starts with "to save on LLM calls" should be treated with suspicion; the
+argument for the cascade is grounding and contamination, and the 10–16× call reduction is a
+side effect.
 
 ---
 
@@ -1419,18 +1934,77 @@ usable without it.
   the phase's real quality signal;
 - residual-PII findings by kind, and how many became new detectors or canaries.
 
-**Phase 3**
+**Phase 3 — cascade tiers 1–4**
 
-- verdicts issued; accept / reject / ungrounded counts;
-- **reject rate per service** (the §4.3.6 R6 gate);
+- **tier 1:** conflicting groups and rows by grade (`identical`/`nested`/`partial`/`disjoint`) ×
+  grouping method × threshold; rows queued; rows masked. A rising `disjoint` count between
+  snapshots is an annotation-quality alarm;
+- **tier 2:** out-of-sample macro-AP, micro-AP, micro-F1, macro-F1 under `GroupKFold`, **plus
+  ΔA (raw vs Phase-1 text) and ΔB (with vs without flagged rows in training)** as defined in
+  §4.3.3, and the grouped-vs-ungrouped gap as a leakage diagnostic;
+- **tier 3:** flagged rows by selector; per-service flag counts against per-service positive
+  counts; `common_multilabel_issues` with both directions; `overall_multilabel_health_score`;
+  overlap with tier 1;
+- **tier 4:** kNN disagreement distribution; per-service neighbour purity; the UMAP plot; the
+  count of marginal-only rows that were *not* routed.
+
+**Phase 3 — tiers 5 and 6**
+
+- rows judged, by selecting stratum (S1/S2/S3/S4), and the overlap matrix between strata;
+- verdicts issued; accept / reject / ungrounded counts; **calls made** (first-pass + escalated);
+- **reject rate per service** (the §4.3.10 R6 gate);
 - escalation rate; 3-of-3 / 2-of-3 / 1-of-3 distribution;
 - proposals by service; masked vs queued vs ignored;
 - queue size by routing rule, and the overlap matrix between rules;
 - **human agreement with the judge on the R7 2% audit sample** — this is the number that says
-  whether the auto-apply path was safe;
+  whether the auto-apply path was safe, and it also yields `Yield_judge` for §4.3.12;
 - post-adjudication co-occurrence rates for the three ambiguous pairs, versus the pre-adjudication
   rates (`access-control`/`auth` 17.5%, `logging`/`monitoring` 4.2%, `console-ui` co-label 637)
   [measured].
+
+#### 6.1.1 Agreement statistics: what to use, and the wrong answer to avoid
+
+Several of the numbers above are **agreement between two parties on a set-valued label** —
+judge vs stored, judge vs human, reviewer vs reviewer. The instinct is Cohen's κ. **Cohen's κ is
+not defined for this target and must not be used.** It assumes each item receives exactly one of
+K mutually exclusive categories; here each item receives a *subset* of 20 services with
+`|S| ∈ 1..4`.
+
+**The two ways people reach for it anyway, and why both produce a meaningless number:**
+
+- **Flatten to `(row, service)` binary cells and call `sklearn.metrics.cohen_kappa_score`.**
+  [measured] the label matrix is 8,771 positives in 4,622 × 20 = 92,440 cells — **90.51% of cells
+  are agreed negatives.** The statistic is then dominated by the two parties agreeing that
+  `terraform-provider` does not apply, and the chance-correction term is computed against a
+  marginal that averages 20 wildly different base rates (851 positives for `billing`, 15 for
+  `terraform-provider`). The number will look reassuringly high and will move for reasons that
+  have nothing to do with the disagreements you care about.
+- **Treat the whole label set as one category.** That is up to 2²⁰ categories, most observed once,
+  so expected agreement `p_e → 0` and `κ → raw agreement`. The chance correction — the entire
+  reason to use κ — does nothing.
+
+**What to report instead, in this order:**
+
+1. **Krippendorff's α with the MASI distance** — the standard instrument for set-valued
+   annotation ([Passonneau 2006](https://www.researchgate.net/publication/228528415_Measuring_agreement_on_set-valued_items_MASI_for_semantic_and_pragmatic_annotation)),
+   and **already the project's chosen metric** for annotator agreement in runbook §4.2 and
+   classifier spec §2.2. Using it here means one agreement statistic across the whole project,
+   comparable between the judge and the humans. MASI weights partial set overlap and penalises
+   the nested case less than the disjoint case — which is exactly the distinction §4.3.2 makes.
+2. **Per-service Cohen's κ as a vector, never averaged into one number.** *Within* one service
+   the decision genuinely is binary and mutually exclusive, so κ is well-defined. Report all 20
+   values with `n_positives` beside each, plus the minimum. This is the view that locates *which*
+   services the disagreement lives in — and [measured] we already expect that to be `console-ui`
+   and `networking`.
+3. **Set-level descriptive companions:** exact-set-match rate, mean Jaccard, and mean MASI
+   similarity. These are uncorrected for chance, so report them **alongside** α, never instead of
+   it.
+
+**Gate wording follows from this:** the α ≥ 0.67 threshold in classifier spec §2.2 applies to
+*annotator* agreement on the gold set and is **not** transferable to judge-vs-stored agreement,
+which measures something different (a model's agreement with a possibly-contaminated column).
+Report judge-vs-stored α as a descriptive number with no gate attached, and gate only on the
+human-adjudicated quantities in §6.2.
 
 ### 6.2 Quality gates, thresholds, and what happens when one fails
 
@@ -1440,7 +2014,7 @@ snapshot is not written, and the run is reported.
 | # | Gate | Threshold | On failure |
 |---|---|---|---|
 | G1 | Structural parse failures | ≤ 0.1% of rows | Stop. The export is malformed; fix the export, not the parser |
-| G2 | Canary redaction recall, structured classes (email, phone, card, ИНН, URL-secret, JWT, AWS key) | **≥ 0.99** | Stop. Add the missing pattern, re-run, add the miss to the permanent canary set |
+| G2 | Canary redaction recall, structured PII classes (email, phone, card, ИНН/ОГРН, bank account, БИК, СНИЛС, passport, transaction reference) | **≥ 0.99** | Stop. Add the missing pattern, re-run, add the miss to the permanent canary set |
 | G3 | Canary redaction recall, NER classes (person, org) | **≥ 0.90** | Stop below 0.90; between 0.90 and 0.95, ship with the gap recorded in the model card and a follow-up ticket |
 | G4 | Over-redaction of protected technical strings | **≤ 0.5%** of protected tokens | Stop. This is the §2.3 failure mode (45% of person-shaped matches are error strings) and it silently destroys the label signal |
 | G5 | Total tokens removed by the boilerplate blocklist | ≤ 60% of corpus tokens | Stop and review the blocklist. [measured] the ≥20× cut removes 48.2% of sentence instances; anything approaching 60% means the cut is eating content |
@@ -1449,21 +2023,39 @@ snapshot is not written, and the run is reported.
 | G8 | Out-of-taxonomy service tokens | **0** | Stop. Either a typo, a retired service, or a taxonomy change requiring a mapping table (classifier spec §4.8). Never auto-drop |
 | G9 | Phase-2 schema-invalid rate | ≤ 5% | Fix the prompt or the schema. Above 20%, the model tier is wrong |
 | G10 | `judge_ungrounded` rate | ≤ 2% | Fix the prompt. This is a grounding failure, not a data finding |
-| G11 | Per-service judge reject rate | ≤ 15% [estimate, calibrate on the pilot] | Hold that service's entire reject list for human sign-off (R6) |
+| G11 | Per-service judge reject rate over the judged pool | ≤ 15% [estimate, calibrate on the pilot] | Hold that service's entire reject list for human sign-off (R6) |
 | G12 | Human agreement with auto-applied judge verdicts (R7 sample) | ≥ 0.90 | Below 0.90, **revert all auto-applied rejects** for that run and route everything to the queue. The auto-apply path is a convenience, not a requirement |
-| G13 | Gold-set contamination assertion | **exactly 0 overlap** | Abort the run. Non-negotiable |
+| G13 | Gold-set contamination assertion, **all Phase-3 tiers** | **exactly 0 overlap** | Abort the run. Non-negotiable |
+| **G14** | **Tier-2 CV is grouped** — assert that no `dup_cluster_id` appears in more than one fold | **0 violations** | Abort tier 2. Ungrouped folds inflate confidence on duplicated rows and hide the errors tier 3 exists to find; [measured] the leakage is +0.91pp micro-F1 |
+| **G15** | Tier-3 flag rate | **≤ 15% of labelled rows** | Above that, either `pred_probs` are broken (check the tier-2 metrics first) or the corpus has a systemic labelling problem that a queue cannot absorb. Stop and diagnose; do not size a queue from it |
+| **G16** | Tier-3 flags on services with < 50 positives | **0 auto-applied** | Route to a human (R2). Eroding a rare service below evaluability is unrecoverable and invisible to every aggregate metric |
+| **G17** | ΔB (label-noise delta, §4.3.3) | **report, do not gate** | [measured] it is **−0.79pp macro-AP** on this fixture, i.e. removing flagged rows *hurts*. A negative ΔB is a finding, not a failure — it says the flags are hard-but-correct rows and that auto-dropping must stay off (§4.3.1) |
 
-### 6.3 Release gates on the finished corpus
+### 6.3 Egress gate on the finished corpus
 
-Run once per snapshot, out of band, before the corpus is used for anything:
+Run once per snapshot, out of band, before the corpus is used for anything or moved anywhere.
 
-- **trufflehog filesystem scan with verification** over the exported corpus. Any *verified*
-  finding is a security incident, not a data-quality issue: destroy the snapshot, rotate the
-  credential, and add the pattern to Phase 1 and to the canary set. Unverified findings go to the
-  §6.5 human sample. (Run as an out-of-band CLI — see the AGPL-3.0 note in §4.1.12.)
-- **gitleaks `dir` scan** with the project ruleset as a cheaper second pass.
-- **A grep for the raw values of every canary** injected in §6.4 — any survivor is a G2/G3
-  failure that the recall computation somehow missed, which would itself be a bug worth finding.
+**Say plainly what this gate is: a control against leaking personal data, not credentials.** The
+credential scanners (`trufflehog`, `gitleaks`) that the first revision of this document put here
+are removed along with the rest of the secrets tier (§2.3) — they detect developer credentials,
+which the product owner states are not present, and they detect no Russian PII at all. Keeping
+them would be dead scaffolding that can only ever fire a false positive.
+
+What the gate actually is:
+
+- **Re-run the full §4.1.4 detector inventory over the *output* corpus and assert zero
+  detections.** This is a self-check, and its value is specific and limited: it cannot find PII
+  classes we do not detect, but it **does** catch the failure mode that actually happens — a row
+  that bypassed redaction because of an ordering bug, a protected-span sentinel that was never
+  restored, a partition written before the detector version was bumped. That class of bug is
+  silent in every other gate.
+- **Grep for the raw value of every canary** injected in §6.4. Any survivor is a G2/G3 failure the
+  recall computation somehow missed, which is itself a bug worth finding.
+- **Assert that no quarantined row and no `is_gold` row leaked into the training partition.**
+- **Assert the corpus contains no free-text column other than the Tier-A `model_input_text`** —
+  in particular, that the raw `description` is not carried into an artifact that leaves the
+  perimeter. Whether raw text is retained at all, and where, is the architect's and the DPO's
+  decision (P9); the pipeline's job is to make the answer checkable.
 
 ### 6.4 Measuring redaction recall without a labelled PII set
 
@@ -1486,12 +2078,14 @@ here we use it to measure what a redactor removes.
    - **RU person names in nominative, genitive, dative and instrumental case** — inflection is
      the single most likely NER failure mode and it must be in the canary set;
    - Latin names, including ones shaped like error strings, to probe over-redaction;
-   - URL secrets in the measured length band (3–14 chars, entropy 1.58–3.81) **and** above it;
-   - JWTs, AWS keys, SSH private key headers, connection strings, `Bearer` headers — **none of
-     which occur in this fixture**, so canaries are the *only* test those detectors will ever get
-     (§4.1.12);
-   - паспорт (`45 03 123456`), СНИЛС, БИК, account numbers — absent here, present in real
-     support traffic.
+   - **bank and transactional details** — 20-digit settlement accounts (р/с, к/с) with and
+     without spacing, БИК, СНИЛС, payment and order references, invoice numbers — **none of which
+     occur in this fixture** (§4.1.12), so canaries are the *only* test those detectors will ever
+     get, and they are the classes the product owner named as material;
+   - паспорт in both `45 03 123456` and `4503 123456` forms, with and without the keyword.
+
+   **No application-secret canaries.** Per §2.3 there are no secrets in production ticket text, so
+   a secret canary would measure a detector we do not ship against a risk we do not have.
 2. **Inject** into a copy of the real corpus at recorded offsets, half inside prose and half
    inside evidence blocks (detectors behave differently in each, and the §4.1.3 protected-span
    masking makes that difference large).
@@ -1504,14 +2098,14 @@ here we use it to measure what a redactor removes.
    tokens that got replaced`. Gate G4 ≤ 0.5%. [measured] this is not hypothetical: 45% of
    English person-name-shaped matches in this corpus are technical strings.
 5. **The canary set is versioned, append-only, and grows.** Every real miss found by a human
-   (§6.5), by trufflehog (§6.3), or by Phase 2's `residual_pii` becomes a permanent canary. This
-   is what stops the same class of miss from recurring.
+   (§6.5), by the egress self-check (§6.3), or by Phase 2's `residual_pii` becomes a permanent
+   canary. This is what stops the same class of miss from recurring.
 
 **The honest caveat, which must appear in the model card verbatim.** Canary recall measures the
 detectors against *the distribution we invented*, which is the distribution we wrote the
 detectors for. **It is an upper bound and it cannot find unknown unknowns.** It is a regression
-test, not an assurance. The complements are the human sample (§6.5), the out-of-band verified
-scan (§6.3), Phase 2's independent second opinion (§4.2.3), and the standing adversarial exercise
+test, not an assurance. The complements are the human sample (§6.5), the egress self-check
+(§6.3), Phase 2's independent second opinion (§4.2.3), and the standing adversarial exercise
 (§4.1.13). Anyone quoting "0.99 redaction recall" without that sentence attached is
 misrepresenting it.
 
@@ -1526,14 +2120,21 @@ cannot support any gate.
 |---|---|---|---|---|
 | **Phase 1** | **200** | 50 uniform random · 50 from the placeholder-touched stratum (922 rows) · 50 from the multiline/evidence stratum (374 rows) · 50 from rows where the boilerplate blocklist or template footer fired (99 alert rows + blocklist hits) | (a) is any PII left? (b) was any label-bearing span destroyed? (c) is the text still readable and grammatical? (d) does the placeholder match what it replaced? | ≥ 2 defects of type (a) or (b) → fix and re-sample |
 | **Phase 2** | **150** | 50 uniform · 50 with the largest fraction of sentences marked filler · 50 where the validator rejected the response | (a) was anything invented? (b) was a signal-bearing sentence marked `pleasantry`? (c) is `is_unactionable` right? | ≥ 3 defects of type (b) → the mined blocklist diff is rejected wholesale, not row by row |
-| **Phase 3** | **100 verdicts** | 40 rejects · 30 accepts · 30 from the 2-of-3 disagreement pool | (a) is the verdict right? (b) does the evidence span support it? (c) for the ambiguous pairs, is the decision rule being applied as written? | judge precision on rejects < 0.85 → auto-apply disabled, everything routes to the queue |
+| **Phase 3, tiers 1+3** | **100 rows** | 30 tier-1 conflicts (all grades) · 40 tier-3 flags sampled across the quality-score range · 30 from the S4 random-audit stratum that the tiers did **not** flag | (a) is the row genuinely mislabelled? (b) if yes, is it noise or taxonomy ambiguity? (c) for tier-1 groups, is the grade right? | This sample yields **`P_cheap`** and **`Yield_judge`** for the §4.3.12 decision. `P_cheap < 0.30` → stop and fix tier 2 before spending any human time on the queue |
+| **Phase 3, tier 5** | **100 verdicts** | 40 rejects · 30 accepts · 30 from the 2-of-3 disagreement pool | (a) is the verdict right? (b) does the evidence span support it? (c) for the ambiguous pairs, is the decision rule being applied as written? | judge precision on rejects < 0.85 → auto-apply disabled, everything routes to the queue |
 | **Blocklist review** | **all** | the full blocklist, once per version | is any entry signal-bearing? | any signal-bearing entry → remove it and add it to the protected-span list |
 
-**On the Phase-3 sample's statistical power, stated plainly:** n = 40 rejects gives judge
-precision to roughly ±10pp at 95%. That is enough for a go/no-go on the auto-apply path and
-**not** enough for a per-service number. Do not publish per-service judge precision from this
-sample; if a per-service number is needed, it needs its own sample per service, and at that point
-the annotation budget conversation from §4.3.7 reopens.
+**On statistical power, stated plainly:** n = 40 gives a proportion to roughly ±10pp at 95%. That
+is enough for a go/no-go on the auto-apply path and on §4.3.12, and **not** enough for a
+per-service number. Do not publish per-service judge precision or per-service tier-3 precision
+from these samples; if a per-service number is needed, it needs its own sample per service, and at
+that point the annotation budget conversation from §4.3.11 reopens.
+
+**The 30 unflagged rows in the tiers-1+3 sample are the most important 30 items in this table.**
+They are the only estimate of the cascade's **recall** — how many genuinely mislabelled rows the
+cheap tiers missed entirely. Everything else in §6 measures precision, and a precision-only
+evaluation of an error-detection system is exactly how you convince yourself a corpus is clean
+when it is not.
 
 ---
 
@@ -1558,8 +2159,18 @@ reconstructed from this CSV.** That has consequences that no amount of text proc
   precisely the one this file cannot test.
 - **This file cannot stand in for the gold set** (2,000 test + 1,000–1,500 val, runbook §4.2).
   Any accuracy number measured on it describes the generator, not the world.
-- **Phase 3 does not repair this.** The judge is another model. A corpus whose labels were
-  author-assigned and then judge-adjudicated has *two* non-human provenance classes, not zero.
+- **Phase 3 does not repair this, and the cascade does not either.** The judge is another model.
+  A corpus whose labels were author-assigned and then judge-adjudicated has *two* non-human
+  provenance classes, not zero. The cheap tiers add no provenance class, but they add no ground
+  truth either — cleanlab tells you a row is *surprising*, not that it is *wrong*, and
+  [measured] on this fixture the two are not the same thing: dropping the flagged rows cost
+  0.79pp of macro-AP.
+- **The cascade's fixture yields are not transferable.** [measured] tier 1 finds ~14 reviewable
+  rows and tier 3 flags 2.06% of rows, *because* the generator assigned labels from a scenario
+  bank and 564 of 565 same-title groups agree exactly. On a real CatBoost-contaminated column
+  both numbers should be several times larger. **Every queue and person-hour figure in §4.3.11
+  must be re-derived on the real export before any budget is committed** — it costs four minutes
+  of CPU (P10).
 - **Dedup thresholds tuned here will be wrong on real data.** [measured] the corpus is
   compositional: 149 sentence types cover 48.2% of sentence instances, and TTR is 0.047–0.054.
   Lexical statistics are systematically lower than a real corpus of this size. The Jaccard 0.80
@@ -1567,9 +2178,13 @@ reconstructed from this CSV.** That has consequences that no amount of text proc
 - **The 391 empty-`services` rows are ambiguous between "untriaged" and "genuinely
   unactionable"** and [measured] cannot be separated by length (median 57 vs 62 tokens). The
   pipeline can flag them; it cannot resolve them.
-- **Whole detector classes are untested.** Zero JWTs, AWS keys, SSH keys, connection strings,
-  `Bearer` headers, `password=` assignments, UUIDs, or tracebacks appear in this file. A green
-  Phase-1 gate here says nothing about them.
+- **Whole detector classes are untested.** Zero bank accounts, БИК, СНИЛС, passport numbers,
+  transaction references, UUIDs, or real tracebacks appear in this file — and bank/transactional
+  details are exactly the class the product owner named as material. A green Phase-1 gate here
+  says nothing about them; only the canary set (§6.4) exercises them at all.
+- **The fixture over-states one risk class and under-states another.** It carries application
+  secrets that production does not (§2.4) and carries none of the bank details that production
+  does. Read both directions before generalising any §6 number.
 
 **What this file *is* good for, and it is genuinely a lot:** exercising every stage end to end at
 realistic volume; measuring throughput and cost; building and human-reviewing the blocklist,
@@ -1584,7 +2199,7 @@ corpus being real.
 |---|---|---|---|
 | 1 | **Train/serve skew** — a Tier-A rule that cannot run at inference | Offline metrics fine, shadow-mode precision collapses. Invisible in every offline number | The tier classification is enforced in code review; the shadow gate (classifier spec §6.7) is the backstop. **Add a CI test that runs the full Tier-A path on a single ticket with no corpus statistics and no network** |
 | 2 | **Signal destruction by over-redaction** | Precision drops on RU/EN slices with pasted evidence; error analysis shows the model never learns error-string features | G4, the §6.5 Phase-1 human sample, the B0-vs-B1 ablation (if B1 loses to raw passthrough, the pipeline is eating signal) |
-| 3 | **Residual secret in the corpus** | Nothing, until it is in a model artifact or a log | G2, §6.3 verified scan, Phase-2 `residual_pii`, the adversarial exercise. **Assume this is nonzero and design storage accordingly** — this is a requirement for `system-architect`, not a hope |
+| 3 | **Residual personal data in the corpus** | Nothing, until it is in a model artifact, a log, or a snapshot that moves | G2/G3, §6.3 egress self-check, Phase-2 `residual_pii`, the adversarial exercise. **Assume this is nonzero and design storage accordingly** — this is a requirement for `system-architect`, not a hope |
 | 4 | **Blocklist eats signal** | A whole class of tickets loses its distinguishing sentence; one service's recall collapses | G5, the full blocklist review, `carries_service_evidence` from Phase 2, per-service recall in the ablation |
 | 5 | **Judge distillation** — the corpus starts to encode the judge's opinions | Model agrees suspiciously well with the judge and no better with humans | `judge_touched` slice in every metrics report; the R7 audit sample; the ablation arms |
 | 6 | **Anchoring in the human queue** | Reviewers rubber-stamp the judge; agreement looks great and means nothing | Interleave **20 blind items** (no verdict shown) into the queue and compare agreement. A large gap proves anchoring — the same A/B classifier spec §7 risk 8 specifies for the gold set |
@@ -1595,6 +2210,10 @@ corpus being real.
 | 11 | **Judge bias on the ambiguous pairs** | Systematic stripping of `console-ui` (9.1% of all positives) or hedging toward accepting both members of a pair | G11 per-service reject rate; post-adjudication co-occurrence rates vs the measured baselines (17.5% / 4.2% / 637) |
 | 12 | **Rare-tail erosion** | `terraform-provider` (15 positives) drops below evaluability; no aggregate metric notices | R2 routes every rare-tail reject to a human; per-service positive counts reported before and after every phase |
 | 13 | **Phase 2 quietly becomes a rewrite** | Someone "simplifies" the span-selection design into text generation; risk 1 follows | The tier table in §4.0 is a contract. **CI test: assert the Tier-A output is byte-identical whether or not Phase 2 ran** |
+| 14 | **Tier-2 CV folds stop respecting duplicate clusters** | A refactor swaps `GroupKFold` for `KFold`; duplicated rows get inflated confidence; tier 3's flag rate silently collapses and the corpus looks clean | **G14 asserts it directly.** [measured] the leakage signature is micro-F1 rising ~0.9pp while macro-AP falls — an odd combination that is itself diagnostic |
+| 15 | **Cleanlab flags treated as ground truth** | Someone auto-drops or auto-relabels the flagged rows; rare services erode; macro metrics fall while micro metrics hold | §4.3.1 forbids it; G16 blocks it for rare services; **G17 reports ΔB, and [measured] ΔB is negative on this fixture** — the evidence that the failure is real, not theoretical |
+| 16 | **The cascade's precision is measured and its recall is not** | Every gate is green, the queue is small, and the corpus is still full of errors nobody looked for | The 30 unflagged rows in the §6.5 tiers-1+3 sample, and the S4 random-audit stratum (R7). Both exist solely to estimate recall; **neither may be dropped for budget** |
+| 17 | **Model/library version drift in the cascade** | A cleanlab or scikit-learn upgrade changes which rows were flagged, so a snapshot cannot be reproduced and a past human review cannot be re-derived | `cleanlab_version` and `tier2_run_id` in the snapshot manifest (§5.1); pinned versions (§9.3) |
 
 ---
 
@@ -1604,14 +2223,17 @@ corpus being real.
 |---|---|---|---|
 | **P1** | **Does 152-FZ permit pseudonymised ticket text to leave the perimeter for LLM processing?** | Legal / DPO (classifier spec Q7) | Decides self-hosted vs hosted for Phases 2 and 3. §4.2.6 defaults to self-hosted so work is not blocked, but the quality ceiling differs |
 | **P2** | **Is there a self-hosted LLM available inside the perimeter, and of what tier?** | Infra / `system-architect` | If not, and P1 says no, Phases 2 and 3 cannot run at all and the pipeline is Phase 1 only — which §3's B1 baseline says may be sufficient anyway |
-| **P3** | **Who authors the decision rules for `auth`/`access-control`, `monitoring`/`logging`, `console-ui`?** | Product owner | §4.3.3. These are taxonomy decisions, not ML decisions. Without them the judge is guessing and so are the annotators |
-| **P4** | **Can ~46 person-hours be allocated for the queue and validation, *in addition to* the ~70 h gold budget?** | Support lead (classifier spec Q9) | §4.3.7. If the answer is no, Phase 3 is dropped and the gold set is protected. **This must not be resolved by taking hours from the gold set** |
+| **P3** | **Who authors the decision rules for `auth`/`access-control`, `monitoring`/`logging`, `console-ui`?** | Product owner | §4.3.7. These are taxonomy decisions, not ML decisions. Without them the judge is guessing and so are the annotators |
+| **P4** | **Can ~25 person-hours be allocated for the queue and validation, *in addition to* the ~70 h gold budget?** (revised down from 46 h by the cascade — §4.3.11) | Support lead (classifier spec Q9) | §4.3.11. If the answer is no, tier 5 and the queue are dropped and the gold set is protected; tiers 1–4 still run, since they need no human. **This must not be resolved by taking hours from the gold set** |
 | **P5** | **What is the NER latency on real tickets?** | Whoever runs the benchmark, week 1 | §4.1.5 gate. Decides whether name redaction is Tier A (runs at inference) or Tier B (training corpus only, with documented skew) |
-| **P6** | **Is a residual secret in the training corpus an acceptable risk, and what is the containment plan?** | Security / DPO | §4.1.13 says the FN rate is nonzero and cannot be proven zero. The honest ask is for a containment requirement (encryption at rest, access control, retention), which is `system-architect`'s to design |
+| **P6** | **Confirm the premise: does production `title`/`description` really contain no application secrets, API keys or program keys?** Who checked, over what window, and how? | Product owner + security | §2.3 takes this as authoritative and removes the entire credential-detection tier on the strength of it. If it is an assumption rather than a measurement, the cheap check is to run a rule pack over one month of real tickets **once**, and record the result. Reinstating the tier later is a preprocessing version bump and a re-run, not a redesign |
+| **P6b** | **Is residual personal data in the training corpus an acceptable risk, and what is the containment plan?** | Security / DPO | §4.1.13 says the FN rate is nonzero and cannot be proven zero. The honest ask is for a containment requirement (encryption at rest, access control, retention), which is `system-architect`'s to design |
 | **P7** | **Does `preprocess.json` have a size budget?** Classifier spec §9.1 says < 50 KB; [measured] the ≥20× blocklist alone is 149 entries ≈ 9 KB here, and a real corpus's could be far larger | `system-architect` | If the budget holds, ship the blocklist as a separate hash-referenced artifact. Either way it must be versioned with the model |
 | **P8** | **Is the judge allowed to see `labels` and `flags`?** | Product owner + ML | They are excluded from the *model* input (classifier spec §2.7), but they are legitimate context for a *judge*. My recommendation is **no** — a judge with more context than the annotator produces verdicts the annotator cannot reproduce, and the queue reviewer then cannot adjudicate. Confirm |
 | **P9** | **Retention: how long are Phase-2/Phase-3 raw LLM responses kept?** | `system-architect` + DPO | They contain quoted ticket text including any residual PII. Needed for audit and for re-running the ablation, dangerous to keep forever |
-| **P10** | **On real data, what is the actual base reject rate?** | Measurement, after the Phase-3 pilot | §4.3.7's queue sizing assumes 8%. At 20% the queue is ~1,600 rows and ~67 h, which changes P4's answer entirely. **Run the 200-row pilot before committing to the queue budget** |
+| **P10** | **On real data, what do tiers 1–3 actually flag?** | Measurement — **four minutes of CPU, no LLM, no human, week 1** | §4.3.11's sizing rests on a **[measured] 2.06% cleanlab flag rate on a fixture whose labels are internally consistent by construction**. At a realistic 10–20% the judged pool is ~600–1,100 rows and the queue is ~400–700 rows / 17–29 h, which changes P4's answer. **This is the cheapest unanswered question in the project — run it first** |
+| **P11** | **Does the LLM judge survive its own decision rule (§4.3.12)?** | Measurement, after the 100-verdict pilot | If `P_cheap ≥ 0.80` and `Yield_judge < 0.10`, drop tier 5 entirely: the corpus then contains **zero** model-provenance labels from this pipeline, which is a materially better position for every future model generation. Do not skip this test to save the pilot's 4 hours |
+| **P12** | **Which encoder is used for the tier-4 embeddings, and does it have to match the shipped classifier?** | ML | My default is the same family (`multilingual-e5-*`) so the neighbourhood structure resembles what the classifier sees. Using a *different* encoder is arguably a better independent check but makes the UMAP diagnostic harder to act on. Low stakes; decide once and record it |
 
 ---
 
@@ -1630,11 +2252,18 @@ contradict me freely on any of them.
 | `preprocess.json` | **the Tier-A contract**: detector inventory + patterns, placeholder set, protected-span list, folding rules, input template, `max_len`, truncation strategy, blocklist hash, `preprocess_version` | see P7 |
 | `boilerplate_blocklist.txt` | frozen sentence blocklist, derived **from the training split only**, human-reviewed | 9 KB at 149 entries [measured] |
 | `gold_ids.json` | the frozen gold-set ID list, content-hashed | small |
-| `judge_verdicts.parquet` | every verdict, evidence span, basis, run id, prompt version, model, self-consistency votes | ~1 MB [estimate] |
+| **`label_conflicts.parquet`** | tier-1 output: group id, grouping method, threshold, member row ids, member label sets, `conflict_grade`, action taken | small |
+| **`tier2_pred_probs.npy` + `tier2_folds.json`** | the `(N, 20)` out-of-sample probability matrix and the exact `GroupKFold` assignment. **Both are required for reproducibility** — cleanlab's output is a pure function of these, so keeping them means a flag list can be re-derived without re-training | ~740 KB at 4,622 rows, fp64 [computed] |
+| **`label_issues.parquet`** | tier-3 output: per row, `cleanlab_flagged`, `label_quality_score`, per-service flags, and the selector definition used | small |
+| **`taxonomy_diagnostics/`** | `common_multilabel_issues` table, `rank_classes_by_multilabel_quality`, `overall_multilabel_health_score`, kNN neighbour-purity table, the UMAP plot. **This directory is the deliverable for the product owner**, not for the trainer | < 1 MB |
+| `judge_verdicts.parquet` | every verdict, evidence span, basis, run id, prompt version, model, self-consistency votes, **and the selecting stratum (S1–S4)** | ~200 KB [estimate] at 288 judged rows |
 | `review_queue.parquet` | routed rows with the firing rule, judge evidence, and reviewer outcome | small |
 | `canary_set.json` + `canary_report.json` | versioned canaries and the recall/precision measurement | small |
 | `pipeline_report.json` | every metric in §6.1 | small |
-| `snapshot_manifest.json` | content hashes of everything above, library versions, `preprocess_version`, `judge_prompt_version`, `judge_model` | small |
+| `snapshot_manifest.json` | content hashes of everything above, library versions (**including `cleanlab_version` and `scikit-learn` version**), `preprocess_version`, `judge_prompt_version`, `judge_model`, `tier2_run_id` | small |
+
+**None of the Phase-3 artifacts ship with the model.** They are dataset-construction evidence.
+The only artifacts that cross into serving are `preprocess.json` and the blocklist (§9.2).
 
 ### 9.2 The inference contract — what must run at serve time
 
@@ -1675,32 +2304,51 @@ preprocessing is.
 Stated as constraints, with the design left open:
 
 1. Phase ordering is a correctness property, not a performance choice: deterministic redaction
-   **before** any LLM call; gold sample drawn **before** Phase 3; the gold-set assertion aborts
-   the run (§4.3.8).
+   **before** any LLM call; gold sample drawn **before** any Phase-3 tier; the gold-set assertion
+   aborts the run (§4.3.13).
 2. Phase 1 must be re-runnable standalone and must produce a complete, valid corpus on its own.
    Phases 2 and 3 are strictly additive.
-3. Raw LLM responses contain quoted ticket text — storage, access control and retention are
+3. **Phase 3 is a cascade of six tiers with a strict dependency order** — tier 2 needs the
+   dup-cluster ids from §4.1.7, tier 3 needs tier 2's probability matrix, tier 5 needs tiers 1, 3
+   and the tier-2 probabilities to form its strata. **Tiers 1–4 must be runnable without any LLM
+   configured at all**, because that is the mode the pipeline runs in if P1/P2/P11 come back
+   negative, and it is the mode it runs in on every re-snapshot where the judge is not re-run.
+4. **Tier 2's cross-validation folds are grouped on `dup_cluster_id` and this is a gate (G14)**,
+   not a convention. It is the single easiest thing in this pipeline to break by accident.
+5. Raw LLM responses contain quoted ticket text — storage, access control and retention are
    yours (P9).
-4. The human review queue needs: the ticket, the judge's verdict and evidence, the firing routing
-   rule, a decision control, **and 20 blind interleaved items per batch** for the anchoring check
-   (risk 6).
-5. `preprocess.json` (plus the blocklist) ships **with the model artifact**, and the serving
+6. The human review queue needs: the ticket, **which tier(s) selected the row**, the judge's
+   verdict and evidence if any, the firing routing rule, a decision control, **and 20 blind
+   interleaved items per batch** for the anchoring check (risk 6). Queue items now arrive from
+   tiers that produce no verdict at all (R8 tier-1 conflicts), so the UI cannot assume a judge
+   verdict is present.
+7. `preprocess.json` (plus the blocklist) ships **with the model artifact**, and the serving
    process asserts version equality at startup.
-6. If NER is Tier A, per-replica memory rises by ~205 MB over the classifier spec §9.4 figure.
-7. Every phase writes a new artifact; nothing is mutated in place. The pipeline must be
-   re-runnable from any phase given the prior phase's output.
+8. If NER is Tier A, per-replica memory rises by ~205 MB over the classifier spec §9.4 figure.
+9. Every phase writes a new artifact; nothing is mutated in place. The pipeline must be
+   re-runnable from any phase given the prior phase's output. `tier2_pred_probs.npy` in
+   particular must be persisted, so tier 3 can be re-run under a new cleanlab version or a new
+   selector threshold without re-training tier 2.
 
 ### 9.5 Sequencing
 
 1. **Week 1** — Phase 1 end to end on the fixture. Canary set v1. Human sample n=200. Gates
    G1–G8. **This alone produces a usable corpus**, and per §3 it may be all that is needed.
 2. **Week 1** in parallel — the NER latency benchmark (P5) and the B0-vs-B1 ablation.
-3. **Week 2** — Phase 2 on a 1,000-row sample as a discovery exercise. Human-review the mined
+3. **Week 1, and this is the change from the first revision — run Phase-3 tiers 1–3 on the real
+   export as soon as it exists.** [measured] four minutes of CPU, no LLM, no human, no budget
+   approval needed. It answers P10, sizes the queue, and produces the taxonomy diagnostics that
+   the annotation guideline (classifier spec §2.2) should be written *against*. **Doing this
+   before the guideline is written is worth more than doing it after.**
+4. **Week 2** — Phase 2 on a 1,000-row sample as a discovery exercise. Human-review the mined
    rule diff. Merge approved rules into Phase 1. Run the §4.2.4 decision rule before committing
    to full coverage.
-4. **Week 2** — the Phase-3 pilot: 200 verdicts, human-adjudicated, calibrating the reject rate
-   (P10), the per-service cap (G11), and the queue size before anyone commits person-hours.
-5. **Week 3** — full Phase 3, the queue, the ablation ladder, the snapshot freeze.
+5. **Week 2** — tier 4, then the §6.5 tiers-1+3 human sample (100 rows, ~4 h). This yields
+   `P_cheap` and `Yield_judge` and therefore **decides whether tier 5 is built at all** (§4.3.12,
+   P11).
+6. **Week 2–3** — if tier 5 survives: the 100-verdict judge pilot, calibrating the per-service
+   cap (G11) and the queue size before anyone commits person-hours.
+7. **Week 3** — the queue, the ablation ladder including rung 3c, the snapshot freeze.
 
 **Nothing in weeks 2–3 blocks the classifier work.** The week-1 Phase-1 corpus is a complete
 input to the training sweep, and the ablation ladder is designed so that later phases are
@@ -1715,7 +2363,15 @@ it. The runbook's order of operations still governs: audit internal messages →
 → annotate blind → adjudicate → compute Case A precision/recall → freeze the snapshot. This
 document supplies steps 4–5's mechanics (cleaning, dedup clusters, language tags, quality flags)
 and adds two stages the runbook does not have (Phases 2 and 3), both of which sit **after** the
-gold sample is drawn and are fenced from it (§4.3.8).
+gold sample is drawn and are fenced from it (§4.3.13).
+
+One addition the runbook should absorb: **its step 7 ("compute Case A label precision/recall and
+Case B agreement, and decide how to train on them") now has a cheap companion that runs at step
+4.** Tiers 1–3 give a label-quality picture — conflict counts, per-service flag rates, the
+`common_multilabel_issues` direction table — **before** the annotation guideline is written, for
+four minutes of CPU and no annotation budget. Runbook §7 orders the annotation first because it
+assumes the only instrument is a human; that assumption is no longer true for the *diagnostic*
+question, though it remains true for every *ground-truth* question.
 
 On this repository's fixture the runbook's steps 1–3 cannot be run at all, because there is no
 `ticket_messages` table (§7.1). That is a property of the fixture, not a gap in the runbook.
@@ -1724,6 +2380,21 @@ On this repository's fixture the runbook's steps 1–3 cannot be run at all, bec
 
 Throwaway measurement scripts, not part of any deliverable and not to be imported by anything:
 `/tmp/claude-0/-home-user-bert-poc/351181d2-9b69-560c-8223-87b870e37c96/scratchpad/m1.py`
-through `m11.py`, plus the downloaded `xlmr_tokenizer.json` used for token counts. Libraries used
-for measurement only: `pandas` 3.0.5, `tokenizers` 0.23.1, `datasketch` 2.0.0, `py3langid` 0.3.0.
-No files were added to the repository outside `docs/specs/`.
+through `m17.py`, plus the downloaded `xlmr_tokenizer.json` used for token counts. Libraries used
+for measurement only: `pandas` 3.0.5, `tokenizers` 0.23.1, `datasketch` 2.0.0, `py3langid` 0.3.0,
+`scikit-learn` 1.9.0, `cleanlab` 2.9.0. No files were added to the repository outside
+`docs/specs/`.
+
+Two measurement caveats that belong with the numbers they qualify:
+
+- **ΔB (§4.3.3, G17) is approximate.** The cleanlab flags used to filter the training folds were
+  computed from the *global* out-of-sample probability matrix, so a flag on a training row was
+  derived from a model that had seen some held-out rows. The proper protocol computes flags with
+  an inner CV inside each outer training fold. The measured effect (−0.79pp macro-AP) is large
+  enough and in a consistent enough direction that the conclusion — flags are not noise on this
+  fixture — survives the approximation, but **the implementation must use the nested protocol**
+  and re-measure.
+- **The tier-4 kNN numbers are a TF-IDF character-cosine proxy**, not embeddings. I did not
+  download an encoder for this specification. The distribution shape will differ under a real
+  sentence encoder and every tier-4 threshold must be re-derived; the *routing rule* (corroborate
+  only, never route alone) is what makes that safe to defer.
