@@ -155,6 +155,7 @@ signal).
 | LLM calls, full build | ≤ 5,013 (Phase 2, all rows) + **~375–600 (Phase 3, over a measured 288-row residual with escalating self-consistency)** ≈ **~5,600**, down from ~10,026 | §6.2 |
 | LLM cost, full build | **$7 (Haiku 4.5) / $21 (Sonnet 5) / $35 (Opus 5)** single-vote, batch pricing, no cache hits; **~$22** for the recommended mixed tier, **~$25** with escalating self-consistency. **Phase 2 is 79–88% of it; the judge is ~$5** | §6.2 |
 | LLM cost, rebuild after a code-only change | **$0** — every response is served from the replay cache | §6.4 |
+| `s01_profile` | **~1 s** at 5,013 rows; **~5 s** at 50,000 [estimate]. No LLM, no new dependency — `pyarrow` + stdlib | §3.1.2 |
 | Cheap-tier CPU cost (tiers 1–3) | **~25 s** at 5,013 rows; **~2 min** at 50,000 [estimate] — tier 2 dominates. *Was ~2.5 min / ~12 min with the embedding tier* | §6.2 |
 | GPU | **not required, and now not even discussable** — the only stage that could ever have wanted one was tier 4 | §6.2 |
 | Machine wall-clock | ~18 min CPU; **2–4 h elapsed**, dominated by batch turnaround | §6.2 |
@@ -188,8 +189,9 @@ residual, and a **manifest** that makes the output a content-addressed artifact 
 
 ```mermaid
 flowchart TD
-  subgraph P0["Phase 0 — ingest"]
+  subgraph P0["Phase 0 — ingest and profile"]
     S00["s00_ingest<br/>CSV → Arrow, canonicalise, snapshot hash"]
+    S01["s01_profile<br/>label-imbalance profile + early gates<br/>~1 s, no LLM, no deps"]
   end
   subgraph P1["Phase 1 — deterministic, no LLM"]
     S10["s10_normalise<br/>text + services hygiene, lang id"]
@@ -224,6 +226,7 @@ flowchart TD
   end
 
   S00 --> S10 --> S11 --> S12
+  S00 --> S01
   S12 --> S20
   S12 --> S40
   S40 --> S42
@@ -382,7 +385,9 @@ writing. Non-nullable is written `!`.
 Physical layout: `data/interim/<stage>/<build_id>/part-0000.parquet` + `_SUCCESS` (§5.2).
 Compression zstd level 3. Row order canonical: `ticket_id` ascending, always.
 
-### 3.1 `s00_ingest` → `raw`
+### 3.1 `s00_ingest` → `raw`, and `s01_profile` → the label-imbalance profile
+
+#### 3.1.1 `s00_ingest` → `raw`
 
 | Field | Arrow type | Notes |
 |---|---|---|
@@ -403,7 +408,126 @@ Compression zstd level 3. Row order canonical: `ticket_id` ascending, always.
 Ingest is **schema-strict and drop-free**: a malformed row fails the stage. There is no
 "skip bad rows" mode. A raw export that will not parse is a fact about the export.
 
-### 3.2 `s10_normalise` → `normalised` (adds)
+#### 3.1.2 `s01_profile` — label imbalance, measured on the input, before anything is spent
+
+**Why this is not a duplicate of the Phase-4 class-balance report.** `s53`/`s54` measure the
+*assembled corpus* at the end of a build. This measures the *input*, in about a second, at the
+start. The distinction pays for itself in one case, and it is a case this fixture actually
+contains: **[measured] `message-queue` projects to 0 test positives and `terraform-provider`
+to 1.** No amount of cleaning, judging or reviewing creates a positive that is not in the
+export. The correct response is a scoping decision — merge the service, exclude it from
+reported metrics, or go and get more data — and nobody should spend ~$25 and ~28 person-hours
+to reach it.
+
+The stage is a pure function of `raw` + `taxonomy.yaml`, depends only on `s00`, and runs
+concurrently with all of Phase 1 onward. `ml-researcher` owns which statistics and how to
+interpret them; the stage, schema, artifact, gates and rendering are mine.
+
+**Design question 1 — raw or normalised `services`? Answer: both, with normalised as the
+headline.** I was asked to decide this rather than assume it, so here is the measurement that
+decides it [measured, this repo, on the committed fixture]:
+
+| Statistic | Profiled **raw** | Profiled **normalised** | Why the raw number is wrong |
+|---|---|---|---|
+| Distinct service tokens | **59** | **20** | 39 phantom services: 15 leading-space (`" console-ui"` ×7), 15 mixed-case (`"Compute"` ×6), 9 trailing-space (`"auth "` ×5). A report claiming 59 services in a 20-service taxonomy is not a finding, it is a bug |
+| Total positives | 8,811 | 8,771 | 40 internal duplicates (`"logging,logging"`) double-counted |
+| Cardinality `\|S\|=4` | 39 | **31** | internal duplicates inflate cardinality — the histogram that spec §2.8 requires is simply wrong when profiled raw |
+| Cardinality `\|S\|=3` | 1,048 | 1,034 | same |
+| `api-gateway` positives | 754 | **751** | the only service where normalisation *reduces* the count — 3 rows carry it twice. A naive profile over-reports it |
+| `message-queue` positives | 30 | **31** | and this one crosses a decision boundary in the other direction |
+
+Publishing raw numbers would mean the early report disagrees with Phase 4 for a reason nobody
+could find — exactly the failure I was warned about. So:
+
+- **Headline tables use normalised values.** They are directly comparable to `s53`/`s54`.
+- **The hygiene delta is reported as its own table**, because it is a real data-quality signal
+  about the export: 39 phantom tokens, 40 duplicate positives, 8 rows whose cardinality was
+  overstated. On a production export a *rising* delta means someone is writing to
+  `tickets.services` without going through the same validation, which is worth knowing.
+- **The anti-drift mechanism is a shared function, not a shared intention.** `s01` and `s10`
+  both call `ticketds.corpus.taxonomy.normalise_services()`. One implementation, one place to
+  change it. *(Note this deliberately does **not** live in `ticketprep`: services hygiene is
+  training-data-only and never runs at inference, so putting it in the skew-seam package would
+  widen that package's contract for no reason — §6.5.)*
+
+**Design question 2 — per-service counts per split, from a stage that runs before splits
+exist.** Both, as suggested, and the projection turns out to be trustworthy enough to act on.
+`s01` applies the same temporal rule as `s51` (sort by `created_at`, 70/15/15, 7-day gaps) but
+**without** dedup or the org-conditioned purge, because those need `s40`. Measured error of
+that projection against the real `s51` output on the fixture:
+
+| | Result |
+|---|---|
+| Max absolute error, per-service test positives | **5** (`monitoring`, 78 → 73) |
+| Mean absolute error | **0.95** |
+| Services below the n≥30 reporting threshold (spec §6.3) | **identical sets** — `{message-queue, terraform-provider, cdn, dns, managed-redis}` under both |
+
+[measured]. The projection is off by ~1 positive on average and **does not change a single
+service's status against the threshold that matters**. That is the validation that makes an
+early warning worth acting on rather than worth double-checking.
+
+Two rules keep the estimate from being cited as final: every projected column is named with a
+`proj_` prefix and carries `is_projection = true` in the artifact, and **`s54` re-emits the
+same table against real splits**, with the run report diffing the two. If the projection error
+ever grows, the diff shows it on the build where it happened.
+
+**Artifact.** `artifacts/runs/<build_id>/profile/` — three files, one dataset:
+
+`profile_services.parquet` — one row per taxonomy service, plus one per unknown token:
+
+| Field | Arrow type | Notes |
+|---|---|---|
+| `service` ! | `string` | normalised; sorted ascending in the file |
+| `in_taxonomy` ! | `bool` | false ⇒ an unknown token (`services_unknown`, §3.2) |
+| `positives` ! | `int32` | rows carrying it, normalised |
+| `positives_raw` ! | `int32` | exact-string count before hygiene — the delta column |
+| `prevalence` ! | `float32` | `positives / rows_labelled` |
+| `proj_train` !, `proj_val` !, `proj_test` ! | `int32` | **projected**, per the rule above |
+| `proj_test_below_30` ! | `bool` | the spec §6.3 "insufficient data" flag, projected |
+| `first_seen`, `last_seen` ! | `timestamp[us, tz=UTC]` | a service absent for 6 months is a taxonomy question |
+| `months_present` ! | `int16` | supports the drift/rare-tail reading |
+| `co_occurs_top` ! | `list<struct<service:string, n:int32>>` | top-5 co-occurring services (spec §2.8) |
+
+`profile_corpus.parquet` — one row, the corpus-level facts: `rows_total`, `rows_labelled`,
+`rows_unlabelled`, `n_services_taxonomy`, `n_services_present`, `n_tokens_raw_distinct`,
+`positives_total`, `positives_total_raw`, `cardinality_hist` (`map<int8,int32>`),
+`cardinality_mean`, `imbalance_ratio` (max/min positives), `gini`, `hygiene_rows_affected`,
+`taxonomy_version`, `input_sha256`.
+
+`profile.json` — the same content, for machine consumers and for the diff.
+`profile.md` — the rendering (below).
+
+**Does it enter `dataset_version`? No — deliberately.** `dataset_version` is the hash of
+*corpus content* (§4.1), and the profile adds no row and no column to the corpus; it only
+observes the input. Folding it in would mean a change to a reporting table invalidated a
+dataset that is byte-identical. Instead: `profile_sha256` is recorded in the manifest under
+`input`, which makes it citable and diffable without giving it authority it should not have.
+The profile is a pure function of `(input.sha256, taxonomy.sha256, code)`, so nothing is lost.
+
+**Gates fire at `s01`, not only at `s53` — otherwise the early warning is not early.**
+`ml-researcher` owns the thresholds; the wiring, severities and failure behaviour are here.
+A gate that only ran in `s53` would report "this service has 15 positives" *after* the build
+it should have prevented.
+
+| Gate | Severity | Behaviour |
+|---|---|---|
+| `G-P1` a taxonomy service has **zero** positives in the input | **hard stop** | build aborts at `s01`, ~1 s in, with the service named. A taxonomy entry nothing has ever been labelled with is a taxonomy bug or an export bug, and every downstream number would silently exclude it. `--force` records `frozen: false` |
+| `G-P2` an unknown token appears in `services` (not in `taxonomy.yaml`) | **hard stop** | same. This is how a rename or a new service reaches us without a mapping table (spec §4.8); guessing is not available |
+| `G-P3` a service is below `min_positives_corpus` (default 50, spec §2.8) | **warn** | reported and carried into the model card. [measured] fires on 4 services here |
+| `G-P4` a service projects below `min_positives_test` (default 30, spec §6.3) | **warn** | reported as "cannot be given a precision number". [measured] fires on 5 |
+| `G-P5` `imbalance_ratio` above `max_imbalance` | **warn** | [measured] 56.7× here (billing 851 / terraform-provider 15) |
+| `G-P6` hygiene delta above `max_hygiene_delta` | **warn** | a rising delta on a production export means something is writing `services` without validation |
+
+Two deliberate choices in that table. **The zero-positive case is a hard stop and the
+15-positive case is a warn**, because they are different kinds of problem: zero positives is
+almost certainly a defect (bad export, stale taxonomy, wrong column), while 15 positives is a
+real fact about the world that needs a *decision* rather than a halt — and halting on it would
+make the pipeline unusable on precisely the long-tail corpora it is built for. **Unknown
+tokens are a hard stop** for the same reason as zero: it means the taxonomy and the data
+disagree, and everything downstream is computed against the wrong label set.
+
+`s53` re-asserts G-P3/G-P4 against *real* splits at the end of the build, so the projected
+warn and the final warn are both on record and the run report can show them side by side.
 
 All of this is `ticketprep` (C6). Semantics — which normalisations, which language detector —
 belong to `dataset-pipeline-cleaning.md`; the *contract* is here.
@@ -830,7 +954,11 @@ write-once/object-lock policy where the backend supports it).
     "external_llm": "allowed",                 // denied | allowed — §6.3, fail-closed
     "legal_clearance_ref": null,               // required when production + allowed
     "exported_at": null,
-    "export_query_sha256": null                // set when the input is a DB export, not a file
+    "export_query_sha256": null,               // set when the input is a DB export, not a file
+    "profile_sha256": "…",                     // §3.1.2 — cited, NOT part of dataset_version
+    "profile_gates": { "G-P1": "pass", "G-P2": "pass",
+                       "G-P3": "warn:4", "G-P4": "warn:5",
+                       "G-P5": "warn:56.7", "G-P6": "pass" }
   },
 
   "code": {
@@ -1147,6 +1275,7 @@ half-write" requirement, and it is four lines of code rather than a transaction 
 | Stage | Idempotent? | On what basis |
 |---|---|---|
 | `s00`–`s12`, `s40`, `s42`, `s46`, `s51`–`s54` | **yes, bit-for-bit** | pure functions of content-addressed inputs + `seed_root` |
+| `s01_profile` | **yes, bit-for-bit, and trivially so** | a pure function of `(raw, taxonomy)` with no seed, no model, no I/O beyond its own output. It is the cheapest stage to re-run in the pipeline (~1 s) and the only one you would happily run on a laptop against a production export before deciding whether to build anything at all |
 | `s43`, `s44` | **yes on a fixed host; bit-for-bit across hosts only under the §4.5 rounding rule** | a fitted model plus floating-point reduction order. Different CPU ⇒ possible last-bit drift, hence the 6-significant-digit rounding of `t2_probs` before ranking |
 | `s29_gold_fence` | **yes, and write-once** | once `gold_ids.json` exists for a `dataset_version` lineage it is never redrawn; redrawing it after tiers have run would retroactively contaminate rows (§6.7) |
 | `s20`, `s30` | **yes, given a warm cache**; **yes modulo the oracle**, cold | the cache makes a re-run free and identical. Cold, with a non-deterministic provider, a re-run may differ — which is exactly why the cache is the reproducibility artifact and not a cost optimisation |
@@ -1656,6 +1785,8 @@ one.
 | What you changed | Re-runs | LLM spend | CPU | Elapsed |
 |---|---|---|---|---|
 | A comment, a test, a docstring | nothing (`stage_input_hash` unchanged) | $0 | — | seconds |
+| **Profile gate thresholds or rendering** | **`s01` only** — nothing downstream depends on it (§3.1.2) | $0 | ~1 s | **~1 s** |
+| **`taxonomy.yaml`** | `s01` (+ `s10`, `s53` — the taxonomy is a real input everywhere) | $0 | ~25 s | ~1 min |
 | Gate thresholds | `s53`→`s55` | $0 | — | seconds |
 | Split ratios, gap days, `org_purge_jaccard`, `seed_root` | `s51`→`s55` | $0 | — | ~1 min |
 | Review verdicts returned / a new round added | `s50`→`s55` | $0 | — | ~2 min |
@@ -1812,6 +1943,8 @@ no property whose name or enum intersects the taxonomy.
 `artifacts/runs/<build_id>/run_report.json` (+ a rendered `.md`, and it is attached to the PR
 that freezes a corpus). Contents:
 
+- **The label-imbalance profile, first, above everything else.** See §7.1.1 — it is the
+  cheapest section to produce and the one most likely to change what anybody does next.
 - **Per stage**: `rows_in`, `rows_out`, `duration_s`, `skipped`, and **`dropped_by_reason`**
   as a map. Rows in minus rows out minus drops must equal zero; the report asserts it.
 - **Phase 1**: redaction counts by kind, rows with zero detections, `services_unknown`
@@ -1843,6 +1976,56 @@ that freezes a corpus). Contents:
 Logging: structured JSON to stdout, `ticket_id` + hashes + counts only. See §8.4 — the
 denylist filter is a security control, not an observability preference.
 
+#### 7.1.1 Displaying the label-imbalance profile
+
+The user's word was "shown", so the rendering is a deliverable. This is a terminal-driven
+`make` job, so the profile is rendered as **a sorted text table with inline bars**, written to
+`profile.md`, inlined at the top of `run_report.md`, and **printed to stdout by `s01` as it
+runs**. Sorted ascending by positives, because the actionable rows are at the top and a reader
+who stops after five lines has still seen the finding.
+
+```
+LABEL IMBALANCE — services (input profile, normalised)     [ds input 9f3c… · 5,013 rows]
+
+  service              positives   prevalence  train/val/test (projected)
+  terraform-provider          15 ▏      0.32%        13 /   1 /   1   ⛔ test < 30
+  message-queue               31 ▎      0.67%        26 /   5 /   0   ⛔ test < 30
+  cdn                         38 ▎      0.82%        28 /   6 /   4   ⛔ test < 30
+  dns                         41 ▍      0.89%        31 /   5 /   5   ⛔ test < 30
+  managed-redis               98 ▉      2.12%        69 /  12 /  17   ⛔ test < 30
+  backups                    271 ██▌    5.86%       192 /  33 /  46
+  …
+  billing                    851 ████████ 18.41%     637 / 119 /  95
+
+  20/20 taxonomy services present · 8,771 positives · mean |S| 1.90 · imbalance 56.7×
+  ⛔ 5 services project < 30 test positives — cannot be given a precision number (spec §6.3)
+  ⚠  4 services below 50 positives corpus-wide (spec §2.8)
+  ℹ  hygiene: 39 phantom tokens, 40 duplicate positives, 8 rows over-counted cardinality
+```
+
+Numbers are [measured] on the fixture; the layout is the specification.
+
+**Chosen: text, not a chart.** A PNG is not readable in a terminal, not diffable in git, not
+greppable, and — the point that decides it — **would reintroduce a plotting stack** two
+revisions after the tier-4 cut removed 1.2 GB of dependencies for exactly this kind of reason.
+`matplotlib` is ~50 MB with its own font cache and backend selection problems in CI. A bar
+made of `█` costs zero dependencies and renders in the terminal, in the PR, and in the
+markdown report. **Rejected**: `matplotlib`/`plotly` PNG or HTML (dependency weight, unreadable
+where the work happens, binary diff); a raw table with no bar (the bar is what makes a 56×
+imbalance visible at a glance, and it is one line of code); rich/textual TUI (a dependency and
+an interaction model for something that should be greppable text in a file).
+
+**What a reader sees first**, in order, and this ordering is deliberate: the rare tail with its
+hard-stop markers → the corpus one-liner → the gate summary. Not the head services. The head
+of the distribution is never the decision; `billing` having 851 positives has never changed
+anybody's plan, and `message-queue` projecting 0 test positives should stop the project for a
+conversation.
+
+The **diff against the previous snapshot** is a per-service `Δ positives` column added whenever
+a previous `profile.json` is available for the same taxonomy version, with services whose
+status crossed a gate threshold called out explicitly (`dns: 41 → 28 ⛔ now below 50`). That is
+the form in which a shrinking rare tail becomes visible before it becomes a problem.
+
 ### 7.2 Failure table
 
 | # | Failure | Blast radius | Intended behaviour |
@@ -1870,6 +2053,9 @@ denylist filter is a security control, not an observability preference.
 | F-20 | **A tier floods the queue** (a threshold change makes tier 3 flag 60% of rows) | reviewer time, and the other tiers get squeezed out | capacity caps per stratum (§5.4) bound this by construction; the run report shows requested-vs-granted per stratum so the squeeze is visible rather than inferred |
 | F-21 | **A gold row was scored by a tier** | **contaminates the only uncontaminated evaluation stream** | `s29` assertion + `s53` re-assert (§6.7). Hard fail, no `--force` |
 | F-22 | `dataset_version` changes with no semantic change (cross-CPU/BLAS drift in tiers 2–3) | trust in the version, which is the whole asset | §4.5: round `t2_probs` before ranking (the mitigation that carries this), pin threads for frozen builds, and `ticketds verify` reports which columns differ so this is distinguishable from a real change in one glance. **Note the hazard is smaller than rev-2 claimed** — thread count alone was measured bit-identical; the untested risk is cross-CPU |
+| F-23 | **The profile disagrees with the Phase-4 class-balance report** | **corrosive** — two numbers for one quantity, and no way to tell which is right | one `normalise_services()` shared by `s01` and `s10` (§3.1.2); projected columns are `proj_`-prefixed and flagged `is_projection`; `s54` re-emits the real numbers and the report diffs them. If they still disagree, that is a bug with a named owner rather than a mystery |
+| F-24 | **The profile's projection is cited as the final split count** | someone plans annotation against an estimate | naming (`proj_*`), an explicit `is_projection` column, the `[projected]` tag in the rendering, and the side-by-side diff in the run report once `s54` has run. [measured] the projection is good — max error 5, same below-threshold set — which makes this a labelling problem rather than an accuracy one |
+| F-25 | **A taxonomy service has zero positives** in the input | every downstream number silently excludes it | `G-P1`, hard stop at `s01`, ~1 s into the build (§3.1.2) |
 
 ---
 
@@ -2099,6 +2285,11 @@ Collected; the reasoning is in the section named.
 | **Tier-3 implementation (§4.8)** | `cleanlab`, multi-label API | `cleanlab`'s **multi-class** API — silently assumes one correct label per row and would flag every 2–4-service ticket; **hand-rolling the confident-joint rank** — buys nothing, since `cleanlab` is maintained, tested and Apache-2.0, and the edge cases it handles are exactly the ones a 50-line reimplementation gets wrong |
 | **Tier 4 — embedding kNN + UMAP (C1c, §3.4)** | **cut entirely** | keeping it as specified — measured *worse* at matched reviewer budget (0.589 vs 0.683 at 185 rows) and failing the ablation control; **downgrading to TF-IDF cosine** — also dominated (0.241 at 185 rows), so it would keep a useless flag list and merely make it cheap; **keeping UMAP as diagnostic-only** — the free tier-2 pair-confusion table is the better instrument for the same question. If it is ever reinstated it must clear validation §5's gate: tier-3 top-N ∪ tier-4 top-M must beat tier-3 top-(N+M), ≥3 seeds, non-overlapping spreads |
 | **Taxonomy diagnostic (§3.7, §7.1)** | per-service-pair tier-2 confusion + co-occurrence, quantitative | a UMAP scatter plot — stochastic layout, no action threshold, and it costs a JIT toolchain (`numba`/`llvmlite`) to produce |
+| **Where label imbalance is measured (§3.1.2)** | **both** — `s01` on the input, `s53`/`s54` on the assembled corpus | only Phase 4 (the rev-3 position) — it reports a scoping problem after the money is spent; only Phase 0 — the input profile cannot see dedup, purges or real splits, so the final numbers would be a projection forever |
+| **Profile `services` handling (§3.1.2)** | normalised headline + raw hygiene delta, via the **same function `s10` uses** | raw only — [measured] reports **59 services in a 20-service taxonomy** and an inflated cardinality histogram; normalised only — discards the hygiene delta, which is a real signal about the export; a private normalisation inside `s01` — two implementations, and the early report drifts from Phase 4 for a reason nobody can find |
+| **Split counts in the profile (§3.1.2)** | projected at `s01` (`proj_*`, `is_projection`) **and** re-emitted for real at `s54` | projection only — an estimate would get cited as final; deferral only — [measured] the projection's max error is 5 positives and it identifies the same below-threshold service set, so waiting for `s51` throws away a correct early warning for nothing |
+| **Profile rendering (§7.1.1)** | sorted text table with `█` bars, ascending by positives | `matplotlib`/`plotly` PNG (~50 MB of dependency two revisions after cutting 1.2 GB, unreadable in a terminal, binary diff); plain table with no bar (the bar is what makes 56× visible at a glance, and it is one line); a TUI (a dependency and an interaction model for something that should be greppable) |
+| **Profile in `dataset_version` (§3.1.2)** | **no** — `profile_sha256` in the manifest instead | including it — a change to a reporting table would invalidate a byte-identical dataset |
 | **Self-consistency (§6.2, §6.6)** | **escalating ≤3 votes** on the measured 288-row residual (~375–600 calls, $5.18) | 1 vote over the whole corpus (rev-1's answer — 9× the cost and a weaker instrument); **unconditional 3 votes** on the residual (864 calls, $7.78 — 288 of them on rows the first pass already cleared); N-of-M by temperature (rejected on current models, fallback §4.2) |
 | **Judge input sizing (§6.2)** | measured demand (288), with `judge.max_rows` = 1,500 as a **non-binding backstop** | a score threshold with no cap — makes a threshold tweak into an unbudgeted spend, the same failure the review capacity cap exists to prevent; sizing from my rev-2 1,400-row *estimate* — superseded by cleaning §4.3's measurement |
 | **Secret scanning in the data path (§8.2)** | **removed** (C10) | keeping `gitleaks`/`detect-secrets`/entropy "just in case" — [measured, cleaning §2.4] 0/81 URL tokens exceed the base64 entropy limit and 40% fall below the hex limit, so it neither works nor has a threat to work on. Retained **only** as a pre-commit guard on our own source tree (§8.5) |
@@ -2116,6 +2307,7 @@ marked `frozen: false` until the gates are real".
 |---|---|---|---|
 | **1** | `.gitignore`, `py/` uv workspace, `Makefile` skeleton, `configs/pipeline.fixture.yaml`, the pre-commit data guard | `make help` works; a stray data file cannot be committed | — |
 | **2** | `s00_ingest` + the schema module + the stage protocol (§5.1) + `run_report` skeleton | `make s00` produces `raw` Parquet + `_SUCCESS` from the fixture, with row counts | 1 |
+| **2b** | **`s01_profile`** + `normalise_services()` + the profile gates + the text rendering | **the label-imbalance report, in ~1 s, before anything else exists.** [measured] it already finds 5 services that cannot be given a test precision number and 4 below 50 positives. It is the earliest point in the whole plan at which the project can learn something that changes its scope | 2, and ml-researcher's thresholds |
 | **3** | `ticketprep` v0.1: `normalise` + `build_input` + `fingerprint` + the golden file (~120 cases initially) | `s10_normalise`; the corpus's dirt inventory from `data/raw/README.md` is covered by tests | 2, and ml-researcher's normalisation semantics |
 | **4** | `ticketprep` v0.2: `redact`; `s11_redact` + `s12_egress_gate` | **the security boundary exists before any text can leave** | 3, and ml-researcher's detector inventory (D-1) |
 | **5** | `s40_dedup` + `s51_split` + `s52_assemble` + `s53_gates` + `s54_report`, wired straight from `s12` (skipping phases 2–3) | **a complete, frozen, `provenance_complete: false` corpus with no LLM involved at all** — the ML team can start baselines on it | 4 |
@@ -2191,3 +2383,5 @@ runs, **and** D-3 has been answered.
 | **D-12** | **Determinism vs wall-clock on tiers 2–3** (§4.5, F-22) — *shrunk to the sklearn-only case* | ML + me | Round `t2_probs` to 6 significant digits before ranking and hashing — **this is the mitigation that carries the risk**, and it covers the cross-CPU case that pinning does not. Pin `OMP_NUM_THREADS=1` for frozen builds too; it now costs seconds rather than minutes. **Note what the validation falsified**: rev-2 justified a 3× wall-clock tax against a thread-count hazard that was then measured **bit-identical** at 1 vs 4 threads. The residual risk is cross-CPU and untested. I would rather record that I priced an unmeasured hazard than quietly drop the paragraph |
 | **D-13** | **Does the cheap-tier report alone settle whether Phase 3 is worth building?** (§10, cleaning §4.3.12) | ML | Decide *after* step 5e and before step 9, on cleaning §4.3.12's measured rule (`P_cheap`, `Yield_judge`) rather than on taste. If it fires, **do not build the judge** — the cascade will have paid for itself by preventing work, and the corpus gains zero model-provenance labels from this pipeline (§3.6) |
 | **D-14** | **OOD signal hand-off.** `t4_dist_to_centroid` was providing the embedding-distance OOD signal that [`llm-fallback-policy.md`](./llm-fallback-policy.md) §2 case 4 requires; tier 4 is cut, so nothing in this pipeline provides it (§3.4) | ML (classifier spec + fallback policy owner) | **The requirement is real and must be re-homed, not dropped.** It belongs at serving time: the threshold is set on the *production model's* validation set and `model_service` already has that encoder loaded, so it is one vector operation against a 20-centroid table shipped with the model artifact alongside `thresholds.json`. Concretely: add the centroid table to classifier spec §9.1's artifact list and move the check into the model service. **I have deliberately not edited those documents** — they are merged and outside this branch, and silently editing a merged spec is how requirements get lost twice |
+| **D-15** | **Profile gate thresholds and severities** (§3.1.2). I have wired G-P1/G-P2 as hard stops and G-P3–G-P6 as warns, with defaults 50 (corpus) and 30 (projected test) taken from spec §2.8/§6.3 | ml-researcher owns the numbers; I own the wiring | Confirm the split between stop and warn. My reasoning: **zero positives is a defect** (stale taxonomy, wrong column, broken export) so it stops; **15 positives is a fact about the world** that needs a scoping decision, so it warns — halting on it would make the pipeline unusable on exactly the long-tail corpora it exists for. If you want a hard stop on the rare tail instead, it belongs in `s53` at ship time, not in `s01` at ingest |
+| **D-16** | **What the profile should do about a service that is present but collapsing over time** — [measured] the fixture has `first_seen`/`last_seen`/`months_present` per service, but no rule attached to them | ml-researcher + product | Report only, for now. A service with 41 positives all from 9 months ago is a different problem from 41 spread evenly, and the columns are there so the question can be asked — but I would not gate on it until someone has looked at a real export and said what "collapsing" means. Flagging it because it is the obvious next request once people start reading this table |
