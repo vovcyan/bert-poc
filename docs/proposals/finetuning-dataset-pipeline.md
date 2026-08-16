@@ -210,7 +210,7 @@ specs.
 | Label audit | **`scikit-learn`** (BSD-3) + **`cleanlab` 2.9.0** (Apache-2.0) + **`umap-learn`** (BSD-3) | Confident learning is the standard instrument for this and is well grounded (Northcutt et al., JAIR 2021). TF-IDF + LR was already a mandatory baseline in the parent spec — it was being computed and thrown away; here it also produces the out-of-sample probabilities tier 3 needs |
 | Dataframes | **`polars`** + Parquet/Arrow | Columnar checkpoints, stable schema at every boundary |
 | Orchestration | **GNU `make` + a `ticketds` Typer CLI** | A 20-minute single-host batch job that gets iterated on, blocked once by a human. **Temporal rejected** (payloads force file-path passing; the human pause is a file, not a signal). **DVC was the strongest rival** — rejected because its cache would put un-redacted raw text in a second place we must remember to shred, and because it cannot express "the prompt changed, reuse 4,900 of 5,013 cached responses" |
-| Human review | **Generated XLSX round-trip** (`openpyxl`), HMAC-checked | ~200 rows, ≤3 reviewers, one batch. Zero infrastructure, zero auth, zero residency question. **Argilla is the named upgrade trigger** if the queue exceeds ~1,500 rows or review becomes recurring. **Prodigy rejected**: closed source in a residency-sensitive pipeline, per-seat cost exceeding the project's entire LLM budget |
+| Human review | **Generated XLSX round-trip** (`openpyxl`), HMAC-checked | ~200 rows, ≤3 reviewers, one batch. Zero infrastructure, zero auth, and no third party sees the data. **Argilla is the named upgrade trigger** if the queue exceeds ~1,500 rows or review becomes recurring. **Prodigy rejected**: closed source in a pipeline handling personal data, per-seat cost exceeding the project's entire LLM budget |
 
 ---
 
@@ -295,14 +295,15 @@ Removing credential scanning does **not** soften the handling posture, and the r
 stating because the next person to argue for looser controls will argue against whatever is
 written down.
 
-Credential exposure is fast, exploitable and **rotatable**. Personal-data exposure is slow,
-un-revocable and regulated. **152-FZ is a personal-data regime and is entirely untouched by this
-change.** So the *detection* tier shrinks and the *handling* controls do not:
+Credential exposure is fast, exploitable and **rotatable**. Personal-data exposure is slow and
+**un-revocable** — there is no equivalent of rotating a key once a name has left the building. The
+ticket text is still personal data after the credential tier is removed, so the *detection* tier
+shrinks and the *handling* controls do not:
 
-- The **egress gate survives on a new argument**: moving personal data is itself the regulated
-  act, regulated whether or not a key travelled with it, and the gate is the only place that act is
-  prevented rather than audited afterwards. With no rotation step available, prevention is worth
-  disproportionately more than detection.
+- The **egress gate survives on a new argument**: moving personal data out of the perimeter is
+  itself the act worth controlling, whether or not a key travelled with it, and the gate is the
+  only place that act is prevented rather than audited afterwards. With no rotation step
+  available, prevention is worth disproportionately more than detection.
 - The gate becomes **two-sided**. With secrets gone, the only false-negative class is personal data
   and the only false-positive class is label signal — so over-redaction is now a blocking check in
   the same stage. Splitting the two directions across two stages is how one quietly stops being
@@ -316,7 +317,7 @@ change.** So the *detection* tier shrinks and the *handling* controls do not:
 
 | # | Decision | Owner | Recommendation |
 |---|---|---|---|
-| **D-1** | **152-FZ: may pseudonymised ticket text leave the perimeter to a hosted LLM API?** | Legal / DPO | Blocks Phases 2–3 on production data, not on the fixture. Default config to `strict`, build the self-hosted provider path in parallel so a "no" costs a week rather than a redesign |
+| **D-1** | **May pseudonymised ticket text leave the production perimeter to a hosted LLM API?** | Legal / DPO | A governance decision, not an engineering one — the text is personal data and the answer may be no. Blocks Phases 2–3 on production data, not on the fixture. Default the config to deny, and build the self-hosted provider path in parallel so a "no" costs a week rather than a redesign |
 | **D-2** | **Is the no-application-secrets premise a measurement or an assumption?** | Backend + security | If assumed, it costs one grep over a production export to check. The pipeline hedges either way, and reinstating the tier is a version bump plus a re-run |
 | **D-3** | **Is a self-hosted LLM available in-perimeter, and at what tier?** | Infra | Needed only if D-1 is "no". The provider seam makes it a config change |
 | **D-4** | **"At most one LLM call per row" — one *attempt* or one *accepted response*, and is the budget scoped per phase?** | User | One accepted response, 3 attempts max; one-attempt-only routes ~0.2–0.5% of rows to a human for a *formatting* failure, spending reviewer time on a machine problem. And **scoped per phase**: the judge's escalating self-consistency is up to three accepted responses per judged row by design. The arithmetic makes the case better than the argument — ~576 calls over 4,622 labelled rows is **0.12 calls per labelled row**, an order of magnitude under the Phase-2 budget it would be compared against. This is a confirmation request, not a request to relax anything |
