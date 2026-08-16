@@ -385,13 +385,20 @@ the tier-2 out-of-sample probabilities — carries one member of a pair while th
 other — which [measured] selects **6 rows** for the four pairs and **65 rows** for `console-ui`,
 not 2,730.
 
-### 2.9 Licensing and residency
+### 2.9 Licensing and data governance
 
-The data is first-party; there is no dataset licence question. The binding constraint is
-**152-FZ** (classifier spec §2.9, open question Q7). It decides §4.2.6 (self-hosted vs hosted
-LLM) and it is not optional. This document assumes the worst case — text may not leave the
-Russian perimeter — and specifies a pipeline that works under it, with the hosted path as a
-documented upgrade if legal clears it.
+The data is first-party; there is no dataset licence question.
+
+The binding constraint is **data governance**: ticket text is personal data (§2.3), so **moving
+it outside the production perimeter is a decision that requires approval, not a default.**
+Whether pseudonymised text may leave the perimeter — to a hosted model provider, to a training
+environment, to anywhere — is owned by legal and the DPO (open question P1), and it is not an
+engineering call. **This document does not make it.**
+
+What this document does instead is make either answer workable. The pipeline is specified so
+that the deterministic phases run anywhere, the LLM phases default to a provider inside the
+perimeter (§4.2.6), and the hosted option is a documented, measurable upgrade rather than an
+assumption baked into the design. Nothing has to be re-architected when the answer arrives.
 
 ---
 
@@ -865,8 +872,9 @@ Four layers, and only the first is a guarantee:
    ticket that defeats the pipeline, and whatever they find becomes a rule and a canary.
 
 And one non-technical layer that outranks all four: **keep the corpus inside the perimeter**
-(§4.2.6). Residual personal data in a corpus that never leaves is a risk to manage; the same data
-posted to a foreign API is a 152-FZ event that has already happened.
+(§4.2.6). Residual personal data in a corpus that never leaves is a risk to manage under our own
+controls; the same data sent to an external provider is a disclosure that has already happened
+and cannot be undone by improving the redactor afterwards.
 
 ---
 
@@ -1055,20 +1063,20 @@ already exists.**
 The real costs of Phase 2 are: engineering time, one more artifact to version, and the risk that
 someone later "simplifies" it into a rewrite and reintroduces skew. Weigh those, not the $19.
 
-#### 4.2.6 152-FZ, and why the phase ordering is load-bearing
+#### 4.2.6 Where the model runs, and why the phase ordering is load-bearing
 
-**Default and recommendation: a self-hosted model inside the Russian perimeter for Phases 2 and
-3.** Three reasons, and the first is the one that decides it:
+**Default and recommendation: a self-hosted model inside the production perimeter for Phases 2
+and 3.** Three reasons, and the first is the one that decides it:
 
 1. **The deterministic redactor's false-negative rate on personal data is not zero and cannot be
-   proven to be zero** (§4.1.13). Sending "redacted" text to a foreign API is a bet that the
-   redactor is perfect. The NER backend's own published **ORG F1 is 0.825**, so roughly one
+   proven to be zero** (§4.1.13). Sending "redacted" text to an external provider is a bet that
+   the redactor is perfect. The NER backend's own published **ORG F1 is 0.825**, so roughly one
    company name in six survives; names in oblique Russian cases are the next-largest gap. Do not
    take that bet with customer text.
-2. **152-FZ** requires that recording, storage and extraction of Russian citizens' personal data
-   occur in databases located in Russia (classifier spec §2.9; open question Q7). Pseudonymised
-   text arguably falls outside the regime — but "arguably" is a legal opinion we do not have, and
-   the pipeline should not be blocked on obtaining it.
+2. **It removes a dependency on an approval we do not have.** Ticket text is personal data, and
+   whether pseudonymised text may leave the perimeter is a governance decision owned by legal and
+   the DPO (§2.9, open question P1). Defaulting to self-hosted means **the pipeline is not
+   blocked on that decision** and does not have to be redesigned whichever way it goes.
 3. **Feasibility is settled by volume, exactly as in llm-fallback-policy §3.** This is a
    **one-off batch of ~5k–50k rows with no latency requirement**, which is a far easier ask than
    the production fallback path that document already found feasible on CPU. A dataset build that
@@ -1079,14 +1087,13 @@ deterministic redaction runs **before** any LLM call, without exception. Phase 2
 `residual_pii` output is a *downstream* protection — it protects the training corpus, the logs,
 Phase 3, and the human queue. It cannot protect the Phase-2 call itself, because by then the text
 has already been sent. Under a self-hosted deployment inside the perimeter, that residual
-exposure is not a disclosure event at all, which is the fourth reason self-hosting is the
-default.
+exposure never crosses a boundary at all, which is the fourth reason self-hosting is the default.
 
-**Upgrade path.** If legal (Q7) clears pseudonymised text leaving the perimeter, run a
-**200-row head-to-head** — self-hosted versus hosted frontier — scored against human-adjudicated
-span roles, and switch if the hosted model's agreement is materially better. Record which model
-produced every row's metadata in the provenance record either way, because a mid-snapshot model
-switch is otherwise invisible and irreproducible.
+**Upgrade path.** If the governance decision (P1) permits pseudonymised text to leave the
+perimeter, run a **200-row head-to-head** — self-hosted versus hosted frontier — scored against
+human-adjudicated span roles, and switch if the hosted model's agreement is materially better.
+Record which model produced every row's metadata in the provenance record either way, because a
+mid-snapshot model switch is otherwise invisible and irreproducible.
 
 ---
 
@@ -2221,7 +2228,7 @@ corpus being real.
 
 | # | Question | Owner | Why it blocks |
 |---|---|---|---|
-| **P1** | **Does 152-FZ permit pseudonymised ticket text to leave the perimeter for LLM processing?** | Legal / DPO (classifier spec Q7) | Decides self-hosted vs hosted for Phases 2 and 3. §4.2.6 defaults to self-hosted so work is not blocked, but the quality ceiling differs |
+| **P1** | **May pseudonymised ticket text leave the production perimeter — to a hosted model provider, or to a training environment?** | Legal / DPO (classifier spec Q7) | Decides self-hosted vs hosted for Phases 2 and 3. §4.2.6 defaults to self-hosted so no work is blocked on the answer, but the quality ceiling differs. **This is a governance decision, not an engineering one; the spec states the requirement and does not attempt the reasoning** |
 | **P2** | **Is there a self-hosted LLM available inside the perimeter, and of what tier?** | Infra / `system-architect` | If not, and P1 says no, Phases 2 and 3 cannot run at all and the pipeline is Phase 1 only — which §3's B1 baseline says may be sufficient anyway |
 | **P3** | **Who authors the decision rules for `auth`/`access-control`, `monitoring`/`logging`, `console-ui`?** | Product owner | §4.3.7. These are taxonomy decisions, not ML decisions. Without them the judge is guessing and so are the annotators |
 | **P4** | **Can ~25 person-hours be allocated for the queue and validation, *in addition to* the ~70 h gold budget?** (revised down from 46 h by the cascade — §4.3.11) | Support lead (classifier spec Q9) | §4.3.11. If the answer is no, tier 5 and the queue are dropped and the gold set is protected; tiers 1–4 still run, since they need no human. **This must not be resolved by taking hours from the gold set** |
