@@ -6,8 +6,11 @@ Date: 2026-08-16 · **rev. 2** — two changes from the user, both structural:
 **(1)** application-secret detection is removed from the pipeline (there are none in the real
 ticket text), so §8 is re-derived against a personal-data threat model;
 **(2)** Phase 3 becomes a **cheap-first cascade** — duplicate-label conflicts → grouped-CV
-TF-IDF+LR → `cleanlab` → embedding kNN → LLM judge **on the residual** → human — which adds
-five stages, a new class of artifact (fitted models, §4.8), and a re-cost.
+TF-IDF+LR → `cleanlab` → LLM judge **on the residual** → human — which adds four stages, a new
+class of artifact (fitted models, §4.8), and a re-cost.
+**rev. 3** — the embedding-kNN tier is **cut** on measured evidence
+([`knn-tier-validation.md`](./knn-tier-validation.md)); `s45`, the UMAP artifacts, the
+embedding checkpoint and four heavy dependencies go with it.
 
 Owns: **runtime**. Stage decomposition, schemas at every boundary, reproducibility and
 freezing, the LLM call layer, the human-supervision loop, orchestration, repo layout, the
@@ -77,7 +80,8 @@ emit `split ∈ {val, test}` unless the config explicitly sets
 | # | Constraint | Source | Consequence here |
 |---|---|---|---|
 | C1 | Three phases, in order: deterministic clean → ≤1 LLM call/row → label audit → human queue | user brief | the spine of the DAG (§2.2). I add a fourth, corpus-level phase — see §1.4 |
-| C1b | **Phase 3 is a cheap-first cascade**: (1) duplicate-label conflicts → (2) grouped-CV TF-IDF+LR probabilities → (3) `cleanlab` confident learning → (4) embedding-kNN agreement + a once-only UMAP diagnostic → (5) LLM judge **on the residual only** → (6) human review | cleaning spec (respecified) | five new corpus-level stages, a fitted-model class of artifact the pipeline did not previously have (§4.8), and a re-cost (§6.2) |
+| C1b | **Phase 3 is a cheap-first cascade**: (1) duplicate-label conflicts → (2) grouped-CV TF-IDF+LR probabilities → (3) `cleanlab` confident learning → ~~(4) embedding kNN + UMAP~~ **cut, see C1c** → (5) LLM judge **on the residual only** → (6) human review | cleaning spec | four new corpus-level stages, a fitted-model class of artifact the pipeline did not previously have (§4.8), and a re-cost (§6.2) |
+| C1c | **Tier 4 (embedding kNN + UMAP) is cut on measured evidence.** At matched reviewer budget it makes the cascade *worse* — 0.589 vs 0.683 injected-error recall at 185 rows, 3 seeds, non-overlapping spreads — at every budget from 25 to 500 rows and under both representations; its unique flags fail the same ablation control that produced the route-only invariant; and the flag has no null model (9.4% of rows clear ≥0.95 by chance, the top-56 beats its own null by +0.012, and 17 of 56 sit *below* it) | [`knn-tier-validation.md`](./knn-tier-validation.md) §3.5, §3.7, §3.8 | `s45`, `audit_t4`, `t4_*`, UMAP, the embedding checkpoint and matrix, `models/`, `ticketds models pull`, D-11, and `sentence-transformers`/`torch`/`transformers`/`umap-learn` are all deleted. Tier numbering is **kept**, with 4 marked cut, because renumbering would invalidate cross-references in three documents |
 | C2 | Freeze with a content hash; never train against a live query | runbook §7.8, spec §9.5 | §4 in full |
 | C3 | Temporal split, grouped by `organization_id`, ≥1-week gap | runbook §6, spec §2.6 | **partially infeasible as written — measured, see §3.5** |
 | C4 | Dedup before sampling, not after | runbook §4.3 | `s40_dedup` runs before the review queue is drawn (§2.2) |
@@ -151,18 +155,22 @@ signal).
 | LLM calls, full build | ≤ 5,013 (Phase 2, all rows) + **~375–600 (Phase 3, over a measured 288-row residual with escalating self-consistency)** ≈ **~5,600**, down from ~10,026 | §6.2 |
 | LLM cost, full build | **$7 (Haiku 4.5) / $21 (Sonnet 5) / $35 (Opus 5)** single-vote, batch pricing, no cache hits; **~$22** for the recommended mixed tier, **~$25** with escalating self-consistency. **Phase 2 is 79–88% of it; the judge is ~$5** | §6.2 |
 | LLM cost, rebuild after a code-only change | **$0** — every response is served from the replay cache | §6.4 |
-| Cheap-tier CPU cost (tiers 1–4) | **~2.5 min** at 5,013 rows; **~12 min** at 50,000 [estimate] — embedding dominates | §6.2 |
-| GPU | **not required at 50k rows either** — mE5-small INT8 does 143 tickets/s at 128 tokens [measured, spec §4.5] ⇒ 50k in ~6 min on 4 vCPU | §6.2 |
-| Machine wall-clock | ~20 min CPU; **2–4 h elapsed**, dominated by batch turnaround | §6.2 |
-| Human wall-clock | **~200 queue rows × 2.5 min ≈ 8 h**, plus the calibration pilot and per-phase validation ⇒ **~25 person-hours** total. On a real contaminated column expect **~400–700 rows ≈ 17–29 h** | §5.4, cleaning §4.3.11 |
-| Hardware | 1 host, 4 vCPU, 8 GB RAM, 10 GB disk (+1.5 GB for the embedding checkpoint). **No GPU.** | [estimate] |
+| Cheap-tier CPU cost (tiers 1–3) | **~25 s** at 5,013 rows; **~2 min** at 50,000 [estimate] — tier 2 dominates. *Was ~2.5 min / ~12 min with the embedding tier* | §6.2 |
+| GPU | **not required, and now not even discussable** — the only stage that could ever have wanted one was tier 4 | §6.2 |
+| Machine wall-clock | ~18 min CPU; **2–4 h elapsed**, dominated by batch turnaround | §6.2 |
+| Human wall-clock | **~285 queue rows × 2.5 min ≈ 12 h**, plus the calibration pilot and per-phase validation ⇒ **~28 person-hours** total. On a real contaminated column expect **~400–700 rows ≈ 17–29 h** | §5.4, cleaning §4.3.11 |
+| Hardware | 1 host, 4 vCPU, 8 GB RAM, 10 GB disk. **No GPU, no model checkpoint, no `torch`.** | [estimate] |
 
 **Cost is not a decision variable here.** A full build costs less than an hour of an
 engineer's time. Every trade-off below is decided on operational simplicity, reproducibility
 and blast radius — never on saving $30. Note that the cascade **is not justified by the $32
-it saves** — it is justified because tiers 1–4 produce a label-quality report with no LLM in
+it saves** — it is justified because tiers 1–3 produce a label-quality report with no LLM in
 it at all (§10), and because a [measured] 288-row LLM residual is a set a human can actually
 audit end to end.
+
+That framing is also what made tier 4 removable without argument: it was never carrying the
+cost case, so when it failed to carry the *quality* case (C1c) there was nothing left holding
+it in. A stage that survives only because it is cheap is a stage nobody is measuring.
 
 ---
 
@@ -194,11 +202,10 @@ flowchart TD
   subgraph P4A["Phase 4a — corpus-level, deterministic"]
     S40["s40_dedup<br/>exact + MinHash/LSH clusters"]
   end
-  subgraph P3C["Phase 3 tiers 1–4 — cheap, CPU-only, no LLM"]
+  subgraph P3C["Phase 3 tiers 1–3 — cheap, CPU-only, no LLM<br/>(tier 4 cut — knn-tier-validation.md)"]
     S42["s42_label_conflicts<br/>tier 1: same text, different labels"]
     S43["s43_cv_probs<br/>tier 2: TF-IDF + OvR LR,<br/>folds GROUPED by dedup cluster"]
     S44["s44_confident_learning<br/>tier 3: cleanlab multi-label ranking"]
-    S45["s45_knn_agreement<br/>tier 4: embedding kNN + UMAP diagnostic"]
     S46["s46_triage<br/>union tier scores → residual set"]
   end
   S29["s29_gold_fence<br/>freeze gold_ids.json; assert ∩ = ∅"]
@@ -223,11 +230,8 @@ flowchart TD
   S40 --> S43
   S20 --> S43
   S43 --> S44
-  S40 --> S45
-  S20 --> S45
   S42 --> S46
   S44 --> S46
-  S45 --> S46
   S20 --> S29
   S40 --> S29
   S29 --> S30
@@ -240,16 +244,17 @@ flowchart TD
   S51 --> S52 --> S53 --> S54 --> S55
 ```
 
-**What changed from the previous revision, and why.** Phase 3 used to be one stage
+**What changed across revisions, and why.** In rev-1, Phase 3 was one stage
 (`s30_llm_judge`) that ran over every labelled row and could execute concurrently with
-`s40_dedup`. It is now six stages, five of which use no LLM, and the LLM stage is last and
-smallest. Consequences worth naming:
+`s40_dedup`. It is now five stages, four of which use no LLM, and the LLM stage is last and
+smallest. Rev-3 removed a sixth (`s45_knn_agreement`, tier 4) on measured evidence — C1c.
+Consequences worth naming:
 
 | Consequence | Detail |
 |---|---|
-| **`s30` is no longer concurrent with the corpus phase** | it depends on `s46_triage`, which depends on `s40`, `s43`, `s44`, `s45`. The DAG serialises. Cost: ~2.5 min of CPU on the critical path [estimate]. This is the price of only paying an LLM for rows four cheaper instruments could not resolve |
+| **`s30` is no longer concurrent with the corpus phase** | it depends on `s46_triage`, which depends on `s40`, `s43`, `s44`. The DAG serialises. Cost: **~25 s** of CPU on the critical path [estimate] — it was ~2.5 min before tier 4 was cut. This is the price of only paying an LLM for rows three cheaper instruments could not resolve |
 | **`s43` consumes `s40`'s clusters, not just its output** | CV folds are **grouped by `dedup_cluster_id`**. Without that, a row's near-duplicate sits in its own training fold, the LR memorises it, `pred_prob` for that row is inflated, and `cleanlab` under-ranks the very rows tier 1 already told us are suspect. This is the same leakage the split rule guards against (§3.5), one layer earlier |
-| **A new artifact class** | tiers 2–4 *fit models*. The pipeline was previously deterministic-plus-cached-oracle; a fitted vectoriser, an LR coefficient matrix and an embedding checkpoint are a different kind of dependency and get their own reproducibility treatment (§4.8) |
+| **A new artifact class** | tier 2 *fits a model*. The pipeline was previously deterministic-plus-cached-oracle; a fitted vectoriser and an LR coefficient matrix are a different kind of dependency and get their own reproducibility treatment (§4.8). Cutting tier 4 removed the heaviest member of this class — a downloaded checkpoint — leaving only artifacts the pipeline produces itself |
 | **`s29_gold_fence` is now a stage, not a convention** | it materialises `gold_ids.json` *before* any tier writes a label opinion, and every Phase-3 tier takes the complement (§6.7). Closes proposal §7.2 |
 
 Four ordering decisions that earn their place:
@@ -270,12 +275,12 @@ Four ordering decisions that earn their place:
   covering 168 rows (3.35%), of which **9 clusters covering 71 rows carry disagreeing label
   sets**. That corroborates cleaning §2.5's 33 clusters / 174 rows within LSH sampling noise.
   71 rows is a small yield and it is *free*, deterministic, and 100% precise.
-- **`s43_cv_probs` feeds `s44` and `s45` reads `s20` output**, so tiers 2–4 all consume
-  cleaned text. This is deliberate and is the one place the cascade depends on Phase 2: a
-  boilerplate-stripped row gives the TF-IDF baseline a better signal-to-noise ratio, and the
-  parent spec §3 requires that baseline anyway. If Phase 2 is ablated out (cleaning §5.2 rung
-  B1), tiers 2–4 fall back to Phase-1 text — `s43`/`s45` take a `--text-source` parameter
-  which is part of their stage input hash, so the two variants cache separately.
+- **`s43_cv_probs` reads `s20` output**, so tiers 2–3 consume cleaned text. This is deliberate
+  and is the one place the cascade depends on Phase 2: a boilerplate-stripped row gives the
+  TF-IDF baseline a better signal-to-noise ratio, and the parent spec §3 requires that
+  baseline anyway. If Phase 2 is ablated out (cleaning §5.2 rung B1), tiers 2–3 fall back to
+  Phase-1 text — `s43` takes a `--text-source` parameter which is part of its stage input
+  hash, so the two variants cache separately.
 
 ### 2.3 Execution substrate — decision
 
@@ -313,7 +318,7 @@ py/                              # uv workspace root: pyproject.toml + uv.lock (
     src/ticketds/cli.py
     src/ticketds/stages/{s00_ingest,s10_normalise,...,s55_freeze}.py
     src/ticketds/llm/{provider,anthropic_batch,openai_compat,cache,executor,schemas}.py
-    src/ticketds/audit/{conflicts,folds,cv_probs,confident_learning,knn,umap_diag,triage}.py
+    src/ticketds/audit/{conflicts,folds,cv_probs,confident_learning,triage}.py
     src/ticketds/corpus/{dedup,split,assemble,gates,gold_fence}.py
     src/ticketds/review/{workbook,merge}.py
     src/ticketds/{config,hashing,manifest,io,logging}.py
@@ -324,11 +329,10 @@ configs/
 prompts/
   phase2_clean/v3/{system.md,schema.json,bundle.yaml}
   phase3_judge/v2/{system.md,schema.json,bundle.yaml}
-models/                          # gitignored. Local cache of the embedding checkpoint (§4.8)
 data/                            # gitignored except the two exceptions below
   raw/  interim/  processed/  review/
 artifacts/                       # gitignored, entirely
-  runs/  llm_cache/  corpus/  audit/     # audit/ = fitted vectoriser, LR, probs, embeddings (§4.8)
+  runs/  llm_cache/  corpus/  audit/     # audit/ = fitted vectoriser, LR, out-of-fold probs (§4.8)
 docs/  Makefile
 apps/  packages/                 # TypeScript (npm workspaces) — reserved, empty today
 ```
@@ -341,7 +345,6 @@ data/**
 !data/raw/README.md
 !data/raw/tickets_export.csv       # SYNTHETIC fixture. The ONLY data file ever tracked.
 artifacts/**
-models/**
 .env
 *.xlsx
 *.joblib
@@ -519,36 +522,38 @@ suspect. Deterministic given the probabilities; no fitting of its own.
 | `t3_rank` ! | `int32` | dense rank over the corpus, so the triage stage can take a top-N without re-deriving a threshold |
 | `t3_cleanlab_version` ! | `string` | pinned; a minor version change moves the ranking (§4.8) |
 
-**`s45_knn_agreement`** (tier 4) → `audit_t4`. Embeds every row with a sentence encoder, then
-scores label agreement against its k nearest neighbours. Also emits the **once-only** UMAP
-taxonomy diagnostic.
+**Tier 4 (`s45_knn_agreement`) is cut — there is no `audit_t4` table and no `t4_*` column.**
+It was specified in rev-2 as embedding kNN label agreement plus a once-only UMAP diagnostic;
+[`knn-tier-validation.md`](./knn-tier-validation.md) measured it and the verdict is C1c. The
+stage is deleted rather than downgraded to TF-IDF cosine, because the TF-IDF variant loses on
+the same measurements (0.241 vs 0.683 at 185 rows), and rather than kept as diagnostic-only,
+because the free tier-2 pair-confusion table is the better instrument for the taxonomy
+question it was meant to answer.
+
+> **One requirement must not be lost in the deletion.** The cut column
+> `t4_dist_to_centroid` was doubling as the **OOD signal** that
+> [`llm-fallback-policy.md`](./llm-fallback-policy.md) §2 case 4 requires — "embedding distance
+> to the nearest training centroid above the validation 99th percentile". That requirement is
+> real and it survives; it simply never belonged in this pipeline. It is a **serving-time**
+> signal: it fires per-ticket at prediction time, its threshold is set on the *production
+> model's* validation set, and the production classifier already has an encoder loaded, so
+> computing it there costs one extra vector operation against a table of 20 centroids shipped
+> with the model artifact. Computing it here would mean carrying a second, unrelated encoder
+> whose distances are not even on the same scale as the one that will serve.
+>
+> **Hand-off, explicit so it is transferred rather than dropped:** the centroid table becomes
+> a model-artifact side file alongside `thresholds.json` and `labels.json` (classifier spec
+> §9.1), produced by the training job from the final encoder, and the OOD check moves into
+> `model_service`. **I am not editing `llm-fallback-policy.md` or
+> `ticket-services-classifier.md`** — both are merged and outside this branch. D-14 carries
+> the hand-off to their owner.
+
+**`s46_triage`** (tiers 1–3 union) → `audit_triage`. The stage that decides what the LLM sees.
 
 | Field | Arrow type | Notes |
 |---|---|---|
 | `ticket_id` ! | `string` | |
-| `t4_knn_ids` ! | `list<string>` | k neighbour ticket ids, **excluding the row's own dedup cluster** — otherwise a near-duplicate is its own nearest neighbour and the tier measures nothing |
-| `t4_knn_agreement` ! | `float32` | mean label-set Jaccard against neighbours, distance-weighted |
-| `t4_neighbour_services` ! | `list<struct<service:string, weight:float32>>` | the neighbourhood's label distribution — the "your neighbours all say `billing` and you do not" signal |
-| `t4_dist_to_centroid` ! | `float32` | distance to the nearest per-service training centroid; doubles as the OOD signal fallback policy §2 case 4 wants |
-| `t4_embedding_model` ! | `string` | pinned checkpoint id + revision (§4.8) |
-
-The **embedding matrix itself is not a corpus column.** It is `artifacts/audit/<build_id>/
-embeddings.f32.npy`, `float32[n_rows, 384]` ≈ **7.7 MB** at 5,013 rows, 77 MB at 50k
-[estimate], with the row order pinned to `ticket_id` ascending and its sha256 in the manifest.
-Putting a 384-dim vector in a Parquet column would triple the corpus size for something no
-consumer of the corpus reads. The UMAP projection is a **diagnostic artifact**
-(`artifacts/audit/<build_id>/umap_taxonomy.png` + the 2-D coordinates), produced once per
-`dataset_version`, never on the row path, and explicitly **not** an input to any routing
-decision — UMAP's layout is sensitive to its own seed and neighbourhood parameters, and
-routing rows to humans on the basis of a stochastic 2-D projection is not defensible. It
-exists to let a human look at whether `auth` and `access-control` occupy the same region.
-
-**`s46_triage`** (tiers 1–4 union) → `audit_triage`. The stage that decides what the LLM sees.
-
-| Field | Arrow type | Notes |
-|---|---|---|
-| `ticket_id` ! | `string` | |
-| `flag_reasons` ! | `list<string>` | e.g. `t1_conflict`, `t3_top_rank`, `t4_neighbour_disagree`, `p2_residual_pii`, `ambiguous_pair`, `random_audit` |
+| `flag_reasons` ! | `list<string>` | e.g. `t1_conflict`, `t3_top_rank`, `p2_residual_pii`, `ambiguous_pair`, `random_audit` |
 | `flag_tiers` ! | `list<int8>` | which tiers fired — kept separately from the reasons so per-tier precision is computable |
 | `triage_score` ! | `float32` | the combined rank used for capacity-bounded selection |
 | `route` ! | `string` | `none \| llm_judge \| human_direct` |
@@ -594,6 +599,13 @@ Known and accepted limitation, stated because the fixture is explicit about it: 
 J≥0.8 **misses semantic-but-not-lexical clusters** (`data/raw/README.md`: the Postgres
 connection-pool cluster scores 0.2–0.5). We do not chase those with embeddings in v1; we
 report `cluster_size` distribution and let §3.5's split diagnostic catch the damage.
+
+Worth being precise about which door the tier-4 cut did and did not close: **it closed
+embeddings as a *label-audit* instrument, not as a *dedup* one.** These are different
+questions with different evidence, and validation §6 says so explicitly. If missed semantic
+clusters bite, the symptom is label conflicts inside groups that tier 1 never formed — at
+which point embeddings are re-opened here, in `s40`, with their own gate. Nothing in C1c
+forecloses that.
 
 ---
 
@@ -740,7 +752,7 @@ here is built on the assumption either way, and the matrix above is correct unde
 | `gold_ids.json` | the frozen gold id list + its sha256 — the fence input (§6.7) |
 | `label_audit.parquet` | the joined tier-1–4 scores and `flag_reasons` for **every** row, not just flagged ones. This is the label-quality report of §10 and it is a deliverable in its own right |
 | `audit_models.json` | fitted-artifact hashes and versions (§4.8) |
-| `umap_taxonomy.png` + `umap_coords.parquet` | the once-only taxonomy diagnostic; explicitly not a routing input |
+| `taxonomy_confusion.parquet` | per-service-pair tier-2 confusion (both directions) + label co-occurrence — the taxonomy diagnostic. **Replaces the UMAP artifacts**, is computed from `t2_probs` at no extra cost, and is quantitative rather than a scatter plot (cleaning §6.1, validation §3.9) |
 
 ### 3.8 Which invariants live where
 
@@ -865,11 +877,7 @@ write-once/object-lock policy where the backend supports it).
     },
     "tier3": { "cleanlab": "2.9.0", "api": "multilabel_classification",
                "params_sha256": "…", "ranking_sha256": "…" },
-    "tier4": { "checkpoint": "intfloat/multilingual-e5-small",
-               "revision": "a4b7c9…",               // the HF commit SHA, never a branch name
-               "weights_sha256": "…", "precision": "int8-onnx", "pooling": "mean",
-               "k": 15, "embeddings_sha256": "…", "embeddings_shape": [5013, 384] },
-    "umap": { "produced": true, "seed_purpose": "audit.umap", "diagnostic_only": true }
+    "tier4": null                                    // cut — see knn-tier-validation.md (C1c)
   },
 
   "seed_root": 20260816,
@@ -915,15 +923,16 @@ human, the design has failed.
 5. `ticketds build --manifest <path> --replay-only` — `--replay-only` makes any cache miss a
    hard error rather than a new API call. A miss means the recipe drifted, and you want to
    know that loudly.
-5b. Fetch the embedding checkpoint: `ticketds models pull --manifest <path>` resolves
-   `label_audit.tier4.checkpoint` **at the pinned `revision`** from the internal mirror and
-   verifies `weights_sha256`. The pipeline never resolves a model by name alone (§4.8).
 6. Assert `dataset_version` matches. Then re-run the metric.
 
-Steps 4–5b are the design's answer to "LLM pipelines are not reproducible". They are, if you
+Steps 4–5 are the design's answer to "LLM pipelines are not reproducible". They are, if you
 treat the model as an **oracle whose answers you archive**, rather than as a function you
 re-invoke — and if you treat every *fitted* model in the pipeline as an artifact you pin
 rather than a computation you assume is stable.
+
+*(Rev-2 had a step 5b here — `ticketds models pull`, fetching the tier-4 embedding checkpoint
+at a pinned revision. Tier 4 is cut (C1c), the command is deleted, and the reproduction
+procedure is one step shorter with no external model to resolve at all.)*
 
 ### 4.4 The LLM replay cache — keyed on exactly what
 
@@ -982,7 +991,6 @@ def unit(seed_root: int, purpose: str, key: str) -> float:   # deterministic U[0
 | Any split tie-break | `split.tiebreak` | |
 | **CV fold assignment (tier 2)** | `audit.folds` | **keyed on `dedup_cluster_id`, not `ticket_id`** — this is the grouping mechanism, so getting the key wrong is the leakage bug, not a style issue |
 | **LR solver / any sklearn `random_state`** | `audit.sklearn` | passed explicitly to every estimator; `liblinear`/`saga` are not deterministic without it |
-| **UMAP** | `audit.umap` | diagnostic only, but a diagnostic that moves between runs is worse than none |
 
 Banned by lint rule (`ruff` custom + a CI grep): bare `random.`, `numpy.random.` module-level
 functions, `np.random.seed`, `pandas.DataFrame.sample` without `random_state`,
@@ -991,26 +999,34 @@ functions, `np.random.seed`, `pandas.DataFrame.sample` without `random_state`,
 is the single sanctioned source of non-determinism and it is excluded from the dataset hash
 (§4.1).
 
-**Determinism the seed does not buy you, and what to do about it.** Tiers 2–4 introduce
-floating-point non-determinism that no seed fixes: BLAS thread count changes reduction order,
-`liblinear` and `saga` converge to slightly different coefficients on different CPUs, and
-ONNX Runtime's thread pool does the same for embeddings. The consequence is that `t2_probs`
-may differ in the last few bits between machines, `cleanlab`'s ranking can then swap adjacent
-rows, and `dataset_version` changes even though nothing meaningful did. Three mitigations, in
-order of how much they cost:
+**Determinism the seed does not buy you — with one claim from rev-2 corrected.** Tiers 2–3
+introduce floating-point non-determinism that no seed fixes: BLAS thread count can change
+reduction order, and `liblinear`/`saga` can converge to slightly different coefficients on
+different CPUs. The consequence would be that `t2_probs` differs in the last few bits between
+machines, `cleanlab`'s ranking swaps adjacent rows, and `dataset_version` changes even though
+nothing meaningful did.
 
-1. **Pin the environment**: `OMP_NUM_THREADS=1`, `intra_op_num_threads=1` for the embedding
-   pass, and record `threads` + the BLAS build in the manifest. Costs wall-clock (about 3×
-   on the embedding pass [estimate]) and buys within-architecture reproducibility.
+> **Correction.** Rev-2 asserted a thread-count hazard and priced a 3× wall-clock tax against
+> it. The validation measured that hazard directly and found **1-thread vs 4-thread output
+> bit-identical** (max abs diff 0.0 over 1,000 rows, all neighbour sets unchanged) on that
+> host — so **the tax bought nothing against the risk it named.** The genuine residual risk is
+> *cross-CPU / cross-BLAS*, which remains untested. I am keeping the pinning rule for tiers
+> 2–3, where `liblinear`/`saga` convergence differences are real and documented, and dropping
+> the claim that thread count alone is a hazard. This is the kind of assumption that should
+> have been measured before it became a policy with a 3× cost attached.
+
+Three mitigations, in order of how much they cost:
+
+1. **Pin the environment for frozen builds**: `OMP_NUM_THREADS=1` for tiers 2–3, and record
+   `threads` + the BLAS build in the manifest. Now cheap — tier 2 is ~20 s, so the tax is
+   seconds rather than the minutes it was when it applied to an embedding pass.
 2. **Quantise the artifacts that feed a ranking**: round `t2_probs` to `float32` with 6
-   significant digits before hashing and before passing to `cleanlab`. A 1e-6 perturbation
-   that flips a ranking was never a signal.
+   significant digits before hashing and before passing to `cleanlab`. **This is the
+   mitigation that actually earns its place** — a 1e-6 perturbation that flips a ranking was
+   never a signal, and unlike thread pinning it addresses the cross-CPU case too.
 3. **Do not let it fail the build silently**: `ticketds verify` reports *which* columns
    differ when `dataset_version` does not match, so "the LR moved in the 7th decimal" is
    distinguishable at a glance from "the prompt changed".
-
-This is a real cost of adding fitted models to a previously bit-deterministic pipeline, and
-it is worth stating rather than discovering in CI.
 
 ### 4.6 Stage skip logic
 
@@ -1031,8 +1047,7 @@ inputs are unchanged prints `SKIP s20_llm_clean (input 4a91… unchanged)` and e
 | Raw production export | encrypted volume in Zone R + **object storage inside the production perimeter**, key = `raw/<sha256>` | PII; irreversible if leaked; git history cannot be scrubbed |
 | Interim Parquet | local only, regenerable | regenerable in 15 min of CPU |
 | **LLM replay cache** | object storage, key = the cache key | 40 MB/build, append-only, and it is the reproducibility asset (§4.3 step 4) |
-| **Embedding checkpoint** (tier 4) | internal model mirror, key = `models/<repo>/<revision>/`; local cache in `models/` | 118 MB INT8 [measured, spec §4.5]. Never pulled from a public hub at build time — see §4.8 |
-| **Fitted vectoriser + LR + `t2_probs` + embeddings** | object storage, prefix `audit/<build_id>/` | ~10 MB/build [estimate]. Regenerable, but keeping them makes a disputed ranking auditable without a rebuild |
+| **Fitted vectoriser + LR + `t2_probs`** | object storage, prefix `audit/<build_id>/` | ~3 MB/build [estimate]. Regenerable, but keeping them makes a disputed ranking auditable without a rebuild |
 | Frozen corpus + `labels.json` + `preprocess.json` + `label_audit.parquet` + `run_report` | object storage, prefix `corpus/<dataset_version>/`, object-lock where available | 3–20 MB; addressed by hash so the manifest is a complete citation |
 
 **Rejected: DVC** — §2.3, plus its cache would hold a second copy of raw text in the working
@@ -1051,10 +1066,16 @@ plain S3-compatible object storage + hashes in a git-tracked manifest**, which i
 ### 4.8 Fitted models inside the pipeline — a new artifact class
 
 Before the cascade, this pipeline contained **no model it had trained itself**. Every
-computation was either deterministic code or a cached call to an external oracle. Tiers 2–4
-change that: a TF-IDF vocabulary, an LR coefficient matrix, an out-of-fold probability matrix
-and a downloaded encoder are all things that can silently differ between runs and that must
-therefore be pinned, hashed and folded into the identity of the dataset.
+computation was either deterministic code or a cached call to an external oracle. Tier 2
+changes that: a TF-IDF vocabulary, an LR coefficient matrix and an out-of-fold probability
+matrix can all silently differ between runs and must therefore be pinned, hashed and folded
+into the identity of the dataset.
+
+Rev-2 also had a *downloaded* member of this class — the tier-4 encoder — which brought a
+commit-SHA pinning rule, a mirror, a `models pull` command, an egress-blocked CI assertion
+and a 471 MB fp32 checkpoint [measured, validation §4]. **All of that is gone with tier 4.**
+What remains is the easier half: every artifact below is produced by this pipeline from
+inputs it already hashes, so there is no external model to resolve, verify or mirror.
 
 | Artifact | Produced by | Pinned how | Hashed as | Lives in |
 |---|---|---|---|---|
@@ -1063,41 +1084,39 @@ therefore be pinned, hashed and folded into the identity of the dataset.
 | Fold assignment | `s43` | `derive(seed_root, "audit.folds", cluster_id)` | `assignment_sha256` over `(ticket_id, fold)` sorted | in `audit_t2` |
 | `t2_probs` matrix | `s43` | — | `probs_sha256` over the rounded `float32` array | `artifacts/audit/<build_id>/probs.npy` |
 | `cleanlab` ranking | `s44` | exact version pin | `ranking_sha256` | in `audit_t3` |
-| **Embedding checkpoint** | pulled, not fitted | **repo id + commit SHA (`revision`), never a branch or a bare name** | `weights_sha256` verified on pull | internal mirror; local `models/` |
-| Embedding matrix | `s45` | — | `embeddings_sha256` | `artifacts/audit/<build_id>/embeddings.f32.npy` |
 
-Four rules, each of which exists because of a specific way this goes wrong:
+Three rules, each of which exists because of a specific way this goes wrong:
 
 1. **Hash the parameters separately from the fitted bytes.** `joblib` output changes when
    `scikit-learn` changes, even for an identical model. If only the pickle were hashed, a
    patch-level dependency bump would look like a model change; if only the params were
    hashed, a genuine data-driven change would be invisible. Record both, and let §4.6's
    invalidation logic key on `params_sha256` + upstream data, not on the pickle.
-2. **`revision` is mandatory for the checkpoint, and it is a commit SHA.** Pinning
-   `intfloat/multilingual-e5-small` by name pins nothing — the repo can be updated, and a
-   model card edit and a weight change look identical from the outside. `ticketds models
-   pull` refuses a config that names a checkpoint without a `revision`, exactly as the LLM
-   provider refuses a floating model alias (§4.4).
-3. **The direction of the traffic is what matters, not its existence.** Downloading
-   weights is outbound and harmless; the risk is the opposite direction — a
-   `sentence-transformers` default that phones home, or an inference client that ships text
-   to a hosted embedding endpoint. **Tier 4 must run locally, on the same host, with no
-   network access during `s45`.** The stage asserts this by running with egress blocked in
-   CI, and the config has no field in which a hosted embedding endpoint could be named. That
-   is a deliberate omission: the way to make an option unavailable is to not build it.
-4. **`dataset_version` includes all of the above via `build_inputs_hash`, but the *ranking*,
-   not the weights, is what actually reaches the corpus.** Tiers 2–4 influence the corpus only
-   through `flag_reasons`, `route`, and whatever `s52` auto-applies. A reviewer who wants to
-   know whether a claimed number depends on the LR can answer it from `label_audit.parquet`
-   without re-fitting anything.
+2. **No stage in this pipeline may resolve a model by name.** With tier 4 gone there is no
+   downloaded model left, and the rule is stated as a standing constraint rather than as
+   guidance about one checkpoint: any future stage that wants external weights must pin them
+   by content hash and immutable revision, exactly as the LLM provider refuses a floating
+   model alias (§4.4). Reintroducing a checkpoint reintroduces a mirror, a pull command and a
+   supply-chain surface, and it should have to argue for all three.
+3. **`dataset_version` includes all of the above via `build_inputs_hash`, but the *ranking*,
+   not the coefficients, is what actually reaches the corpus.** Tiers 1–3 influence the corpus
+   only through `flag_reasons`, `route`, and whatever `s52` auto-applies. A reviewer who wants
+   to know whether a claimed number depends on the LR can answer it from
+   `label_audit.parquet` without re-fitting anything.
 
 **Licences**: `scikit-learn` BSD-3-Clause, [`cleanlab` **Apache-2.0**](https://raw.githubusercontent.com/cleanlab/cleanlab/master/LICENSE)
 *(verified against the repository LICENSE file — early cleanlab releases were AGPL-3.0 and
 that fact is stale; an earlier revision of this document repeated it and was wrong)*,
-`umap-learn` BSD-3-Clause, `datasketch` MIT, `sentence-transformers` Apache-2.0,
-`multilingual-e5-small` MIT (spec §4.3).
+`datasketch` MIT. All permissive; no licence decision to take.
 
-Every dependency the cascade adds is permissive. There is no licence decision to take here.
+**Dependencies removed with tier 4** — and this is the single largest reduction in the
+pipeline's dependency surface, so it is worth listing rather than implying:
+`sentence-transformers`, `torch`, `transformers`, `umap-learn` (which pulls `numba` +
+`llvmlite` + `pynndescent` — a JIT compiler toolchain in a batch data pipeline), plus
+`tokenizers`, `safetensors` and `huggingface_hub` transitively. [measured, validation §4]
+that is **754 MB of `torch` alone** plus a **471 MB checkpoint**. What is left for the whole
+label-audit cascade is `scikit-learn`, `cleanlab`, `datasketch`, `pyarrow` and `numpy` —
+which also makes `ticketds` cheap enough to install in CI without a layer-caching strategy.
 
 ---
 
@@ -1128,7 +1147,7 @@ half-write" requirement, and it is four lines of code rather than a transaction 
 | Stage | Idempotent? | On what basis |
 |---|---|---|
 | `s00`–`s12`, `s40`, `s42`, `s46`, `s51`–`s54` | **yes, bit-for-bit** | pure functions of content-addressed inputs + `seed_root` |
-| `s43`, `s44`, `s45` | **yes on a fixed host; bit-for-bit only under the §4.5 pinning** | fitted models plus floating-point reduction order. Same machine + `OMP_NUM_THREADS=1` ⇒ identical. Different CPU ⇒ possible last-bit drift, hence the rounding rule |
+| `s43`, `s44` | **yes on a fixed host; bit-for-bit across hosts only under the §4.5 rounding rule** | a fitted model plus floating-point reduction order. Different CPU ⇒ possible last-bit drift, hence the 6-significant-digit rounding of `t2_probs` before ranking |
 | `s29_gold_fence` | **yes, and write-once** | once `gold_ids.json` exists for a `dataset_version` lineage it is never redrawn; redrawing it after tiers have run would retroactively contaminate rows (§6.7) |
 | `s20`, `s30` | **yes, given a warm cache**; **yes modulo the oracle**, cold | the cache makes a re-run free and identical. Cold, with a non-deterministic provider, a re-run may differ — which is exactly why the cache is the reproducibility artifact and not a cost optimisation |
 | `s41_queue_build` | yes, but **issuing a batch to humans is not** | re-running `s41` after a batch is out would reissue work. Guarded: `s41` refuses to overwrite a batch whose state is `issued` unless `--supersede` is passed, which records the supersession in the manifest |
@@ -1144,14 +1163,33 @@ half-write" requirement, and it is four lines of code rather than a transaction 
 | Provider 5xx on some rows | retried per §6.6; rows that exhaust attempts get `p2_status='provider_error'` and pass through with **Phase-1 text** (fail-open — Phase 2 is cosmetic) |
 | Provider errors on many rows | if `failed / total > max_row_failure_rate` (default **0.02**), the **stage fails and writes nothing**. A corpus where 30% of rows quietly skipped Phase 2 is worse than no corpus |
 | Judge fails on a row | `j_status='provider_error'` → the row is **routed to the human queue** (fail-closed — Phase 3 touches labels) |
-| **A cheap tier fails entirely** (`cleanlab` raises, the checkpoint will not load) | the stage fails and writes nothing. **The build can still proceed with `--skip-tier N`**, which records the skip in the manifest and in `flag_reasons` as `tier_N_unavailable`, so a corpus built without tier 3 is distinguishable from one where tier 3 found nothing. Never silently degrade a tier to a no-op |
-| **A cheap tier fails on some rows** (empty text, no neighbours in `s45`) | per-row `null` score with a reason, not a zero. A zero is a confident "this row is fine"; a null is "not assessed", and `s46` must treat them differently |
+| **A cheap tier fails entirely** (`cleanlab` raises, tier 2 will not converge) | the stage fails and writes nothing. **The build can still proceed with `--skip-tier N`**, which records the skip in the manifest and in `flag_reasons` as `tier_N_unavailable`, so a corpus built without tier 3 is distinguishable from one where tier 3 found nothing. Never silently degrade a tier to a no-op |
+| **A cheap tier fails on some rows** (empty text, a service below `min_positives_for_tier2`) | per-row `null` score with a reason, not a zero. A zero is a confident "this row is fine"; a null is "not assessed", and `s46` must treat them differently |
 | Gate fails in `s53` | build stops, `run_report` is still written with the failing gate highlighted. `--force` is available and stamps `frozen: false` in the manifest |
 
 The asymmetry is the point: **fail-open on cosmetics, fail-closed on labels.** The cascade
 adds a third rule: **never fail *quietly* on an audit tier.** A missing tier changes what the
 queue contains and therefore what the humans saw, so it has to be visible in the manifest and
 in the run report, not inferable from a suspiciously small `flag_reasons` histogram.
+
+#### 5.3.1 The admission gate for any new row-selection tier
+
+Tier 4 was specified, built into three documents, and then cut on measurement. The cheap way
+to avoid repeating that is to make the measurement a **precondition of admission** rather
+than a post-hoc audit. Any future tier that proposes rows for review — including one that
+claims to be "corroborating only" — must clear this gate before it enters the DAG:
+
+| # | Requirement | Why |
+|---|---|---|
+| G-T1 | **Matched-budget recall beats the incumbent.** On a labelled error set (injected or human-adjudicated), `tier-3 top-N ∪ new-tier top-M` must beat `tier-3 top-(N+M)`, **mean over ≥3 seeds, with non-overlapping spreads** | This is the only comparison that answers the real question — reviewer slots are finite, so a new tier competes against *more of the incumbent*, not against nothing. Tier 4 failed it by 5.5–9.4pp |
+| G-T2 | **The random-drop ablation control.** Dropping the tier's unique flags from training must differ measurably from dropping the same number of random rows | Tier 4's unique flags were indistinguishable from random. A flag list that cannot beat noise in an ablation is not a signal, whatever its internal score looks like |
+| G-T3 | **A stated null model, and a margin over it.** The tier must report what fraction of rows clear its threshold by chance, and its selected set must beat that null by a stated margin | Tier 4's top-56 exceeded its own null by +0.012, with 17 of 56 *below* it — visible only because someone computed the null. A score with no null is unfalsifiable |
+| G-T4 | **Cost declared in reviewer-hours and dependency surface**, not only CPU seconds | Tier 4's real costs were 1.9 review-adjacent hours per snapshot and 1.2 GB of dependencies; neither appeared in its original specification |
+
+**"Corroborating only" does not exempt a tier from G-T1.** It is the same gate with the cost
+moved into sort order, where it is harder to see and impossible to bill. This is the rule that
+would have caught tier 4 at design time; `s53` records gate results per tier so a tier that
+degrades later is caught by routine reporting rather than by a dedicated study.
 
 ### 5.4 The human-supervision loop
 
@@ -1162,27 +1200,41 @@ but its role has changed and the label matters.
 
 Cleaning §4.3.11 now has measured tier-selection counts, which neither this document's earlier
 600 × 75 s = 12.5 h nor proposal §7.1's reconciled ~44 h could have: the cascade routes
-**288 rows (6.2% of labelled rows) to the LLM judge** and **~200 rows to humans** [measured
+**288 rows (6.2% of labelled rows) to the LLM judge** and **~285 rows to humans** [measured
 selection, estimated queue]. Both earlier figures are withdrawn.
 
 | | Value |
 |---|---|
-| **Expected queue** | **~200 rows** = 4.3% of labelled rows |
+| **Expected queue** | **~285 rows** = 6.2% of labelled rows |
 | Per-item rate (unchanged) | **2.5 min** |
-| Queue subtotal | **~8 h** |
-| Calibration pilot + per-phase validation samples (cleaning §6.5) | **~17 h** |
-| **Total ask** | **~25 person-hours**, of which ~8 h is the queue |
+| Queue subtotal | **~12 h** |
+| Calibration pilot + per-phase validation samples (cleaning §6.5) | **~16 h** |
+| **Total ask** | **~28 person-hours**, of which ~12 h is the queue |
 
-**The 2.5 min/item rate stands and is not affected by this correction.** That dispute was
-about the *difficulty* of a queue item, and the cascade makes the survivors **harder**, not
-easier — the easy ones were filtered out by instruments that did not need a human. What
-changed is the count, not the rate.
+**The queue grew, and that is a purchase rather than a regression.** The tier-3 selector was
+widened from `mask ∪ score < 0.20` to **`< 0.30`** — [measured] 161 → **315 flagged rows** —
+on the strength of the same recall curve that cut tier 4. It is roughly the 185→300-row move
+on that curve, worth **+14pp (ambiguous) / +9pp (random)** injected-error recall. `< 0.30` is
+also the natural stopping point: past it the `find_label_issues` mask contributes only 2 rows
+the score cut has not already taken, so the next increment buys almost nothing.
 
-**The 600-row cap is now non-binding, and it should be read as a backstop rather than a
-forecast.** At ~200 expected rows it will not be reached; nobody is planning to fill it. It
+So the honest summary of the tier-4 decision is **not** "we saved reviewer time". The queue is
+*larger* after it. What the cut bought was a better use of the same reviewer hours, a shorter
+critical path, and 1.2 GB of dependencies — and then we spent some of that back, deliberately,
+on more tier-3 rows because the curve says they are worth more than the rows tier 4 was
+offering.
+
+**The 2.5 min/item rate stands and is not affected by any of this.** That dispute was about
+the *difficulty* of a queue item, and the cascade makes the survivors **harder**, not easier —
+the easy ones were filtered out by instruments that did not need a human. What changed is the
+count, not the rate.
+
+**The 600-row cap remains non-binding, and it should be read as a backstop rather than a
+forecast.** At ~285 expected rows it will not be reached; nobody is planning to fill it. It
 exists so that a pathological run — a mis-set threshold, a tier regression, a corpus three
 times noisier than this one — cannot silently turn into a 2,000-row ask on the support team.
-That is worth keeping precisely because it costs nothing when it does not fire.
+Note that it absorbed a 43% increase in expected demand without needing to move, which is the
+cap behaving exactly as a capacity control should.
 
 **It is also, on the scaling numbers, correctly sized for the case that actually matters.**
 The counts above come from a fixture whose labels are author-assigned and internally
@@ -1200,16 +1252,15 @@ export before the support lead is asked for anything (D-5).
 This ask is *in addition to* the runbook §4.2 gold-set budget of ~70 h and must not be taken
 out of it — cleaning §4.3.11 gives four reasons and the first alone settles it.
 
-**Strata, now a union across heterogeneous tiers.** The queue used to be fed by one instrument
-with one precision. It is now fed by five with very different ones, and mixing them without
+**Strata, a union across heterogeneous tiers.** The queue used to be fed by one instrument
+with one precision. It is now fed by four with very different ones, and mixing them without
 recording which fired would make per-tier precision unmeasurable — which is the whole point of
 building a cascade rather than one judge.
 
 | Stratum | Source tier | Share of capacity | Purpose |
 |---|---|---|---|
 | `t1_conflict` | 1 | **all of them, uncapped** | provably-wrong labels, [measured] 71 rows on the fixture. These are cheap, certain, and there are few — never let a percentage cap displace them |
-| `t3_top_rank` | 3 | up to 35% | the confident-learning head. The largest and least precise stratum |
-| `t4_neighbour_disagree` | 4 | up to 15% | rows whose semantic neighbourhood disagrees but whose lexical cluster does not — the class tier 1 structurally cannot see |
+| `t3_top_rank` | 3 | up to **50%** | the confident-learning head, and the largest stratum. Widened from 35% because the tier-3 *selector* widened (`< 0.20` → `< 0.30`, 161 → 315 rows), not because tier 4 released slots — see the correction below |
 | `judge_conflict` / `judge_added` / `judge_removed` | 5 | up to 25% | the LLM residual, ranked by evidence quality (semantics: ml-researcher) |
 | `pipeline_flagged` — `services_empty`, `services_unknown`, `response_invalid`, `provider_error`, `tier_N_unavailable` | — | up to 10% | rows the machine could not process at all |
 | **`random_audit` — uniform random over rows *no tier flagged*** | — | **10%, floor of 60 rows** | **without this, the cascade's false-negative rate is unmeasurable, forever** |
@@ -1222,13 +1273,28 @@ Three properties of this table are load-bearing:
 2. **`flag_tiers` is carried into the workbook's hidden merge key and back out**, so after
    review we can compute *precision per tier* — what fraction of each tier's flags a human
    agreed with. That number is the input to next quarter's capacity allocation, and it is
-   free to collect now and impossible to reconstruct later.
+   free to collect now and impossible to reconstruct later. **Tier 4 is the argument for this
+   field**: it was cut on exactly this measurement, obtained by a dedicated study because the
+   pipeline could not yet produce it. Carrying `flag_tiers` means the next tier that stops
+   earning its slots gets caught by the routine reporting instead.
 3. **The random-audit stratum now covers the whole cascade, not just the judge.** Its floor
    rises with the number of tiers, because it is estimating a union's miss rate: 10% of
    capacity, floor 60 rows, and the floor should be revisited if capacity drops below 400
    (D-5).
+4. **The sort key within `t3_top_rank` is tier-3 rank alone**, tie-broken by R1 (`|S|=1`
+   rejects) then R2 (rare-tail rejects), then the seeded hash. It is a single ordering from a
+   single instrument, which is a property worth naming: rev-2 had `t4_neighbour_disagree` as
+   a corroborating sort input, and validation §5 makes the point that "corroborating only"
+   hides a tier's cost in the sort order rather than removing it.
 
-**The percentage shares are non-binding for the same reason the cap is.** At ~200 expected
+> **Correction to a framing I was given and would otherwise have repeated.** Cutting tier 4
+> does **not** free 56 review slots. Under "corroborating only" tier 4 routed *no* rows — it
+> only reordered them — so there were never 56 slots of its own to reclaim. What the cut
+> actually frees is ~1.9 review-adjacent hours [measured, validation §4], the dependency
+> stack, and a worse sort key. **The queue gets bigger, not smaller** (§5.4). Anyone
+> reconciling these documents should expect the reviewer ask to go *up* across this revision.
+
+**The percentage shares are non-binding for the same reason the cap is.** At ~285 expected
 rows against a 600-row capacity, no stratum is competing for space, so every stratum gets
 everything it asks for and the shares never fire. They are the allocation rule for the
 pathological case, not a plan. Two consistency notes while they are dormant: cleaning
@@ -1273,11 +1339,11 @@ row instead of on a special 100-ticket study.
 
 | Option | Licence | Verdict |
 |---|---|---|
-| **Generated XLSX round-trip** (openpyxl, MIT) ← **chosen** | MIT | ~200 rows, ≤3 reviewers, one batch, blindness guaranteed structurally. Reviewers already have Excel. Zero infra, zero auth, zero deployment, and no third party sees the data. Cost: ~200 lines of writer/merger + the integrity checks below |
-| **Argilla** | Apache-2.0 | The best of the servers: multi-label UI, suggestions/responses model, Python SDK. Rejected **for this build**: needs a deployed server + backend, an SSO story, and a review of where it stores ticket text — for **~8 person-hours** of work. The cascade cut the queue by two thirds, so this rejection got *more* comfortable, not less. **This is still the named upgrade trigger**: adopt it if the queue exceeds ~1,500 rows, or reviewers exceed 3, or review becomes recurring (quarterly retrains, spec §4.8) |
+| **Generated XLSX round-trip** (openpyxl, MIT) ← **chosen** | MIT | ~285 rows, ≤3 reviewers, one batch, blindness guaranteed structurally. Reviewers already have Excel. Zero infra, zero auth, zero deployment, and no third party sees the data. Cost: ~200 lines of writer/merger + the integrity checks below |
+| **Argilla** | Apache-2.0 | The best of the servers: multi-label UI, suggestions/responses model, Python SDK. Rejected **for this build**: needs a deployed server + backend, an SSO story, and a review of where it stores ticket text — for **~12 person-hours** of work. Still comfortably the wrong trade at 285 rows, though less lopsided than at 200. **This is still the named upgrade trigger**: adopt it if the queue exceeds ~1,500 rows, or reviewers exceed 3, or review becomes recurring (quarterly retrains, spec §4.8) — note the queue has now moved toward that trigger twice in two revisions, so it is worth re-checking rather than treating as settled |
 | **Label Studio** (Community) | Apache-2.0 | Server + DB. Multi-label works; the two-pass blind protocol would need two projects and a manual hand-off, which is *worse* than two files. Several review-workflow features sit in the Enterprise tier |
 | **Doccano** | MIT | Lightest server, but its sequence/document-classification model does not carry the per-service evidence and two-round provenance we need without extending it |
-| **Prodigy** | commercial, per-seat [~$390–500/seat, estimate] | Excellent ergonomics and scriptable recipes. Rejected on: closed source in a pipeline that handles customer personal data, per-seat cost for 3 reviewers exceeds the entire LLM budget of the project, and it solves a problem (fast keyboard-driven annotation of 50k items) that we do not have at ~200 rows |
+| **Prodigy** | commercial, per-seat [~$390–500/seat, estimate] | Excellent ergonomics and scriptable recipes. Rejected on: closed source in a pipeline that handles customer personal data, per-seat cost for 3 reviewers exceeds the entire LLM budget of the project, and it solves a problem (fast keyboard-driven annotation of 50k items) that we do not have at ~285 rows |
 | **Google Sheets** | n/a | Rejected on putting ticket text in a third-party service, and on the impossibility of controlling what a shared sheet's revision history retains |
 
 **Round-trip integrity — the boring things that actually go wrong with spreadsheets:**
@@ -1333,13 +1399,12 @@ So: your prior is correct, and I am agreeing with reasons rather than deference.
 
 ### 6.1 Where inference happens in this pipeline
 
-**Four** places now, all **offline and batch**. Two are remote calls behind the provider seam;
-two are local models, which is new in this revision.
+**Three** places, all **offline and batch**. Two are remote calls behind the provider seam;
+one is a local model the pipeline fits itself.
 
 | Where | What runs | Volume | Latency budget | Failure posture |
 |---|---|---|---|---|
 | `s43` (tier 2) | **local** TF-IDF + OvR LR, fitted here | 5,013 rows × 5 folds | none (~20 s) | `--skip-tier 2`, recorded |
-| `s45` (tier 4) | **local** sentence encoder, inference only, **no network** | 5,013 rows | none (~35 s) | `--skip-tier 4`, recorded |
 | `s20` (Phase 2) | remote LLM, per-row cleaning | ≤ 5,013 | none (batch, hours) | fail-open to Phase-1 text |
 | `s30` (tier 5) | remote LLM, label judging | **288 rows [measured]**, ~375–600 calls, not 5,013 | none | fail-closed to the human queue |
 
@@ -1348,12 +1413,13 @@ None of these is the production inference path. The production path is the ONNX 
 volumes, different SLOs, different code. The only thing they share is `ticketprep` (§6.5),
 and that sharing is the point of §6.5.
 
-One coincidence worth *not* acting on: tier 4's encoder (`multilingual-e5-small`) is also a
-candidate production checkpoint (spec §4.3). **These are two unrelated uses and must not be
-coupled.** Tier 4 wants a stable, cheap embedding for neighbourhood structure; production
-wants whichever checkpoint wins on `R@P90`. Pinning them together would mean that changing
-the production model silently re-ranks the label audit of a corpus that trained it — a
-circularity with no upside. They are configured independently and versioned independently.
+Rev-2 had a fourth row here — a local sentence encoder for tier 4 — and a paragraph warning
+that its checkpoint happened to coincide with a candidate *production* checkpoint and must not
+be coupled to it. **Cutting tier 4 dissolves that hazard rather than managing it.** There is
+now exactly one encoder in the project, it lives in `model_service`, and no dataset-build
+stage has an opinion about which checkpoint production ships. That is a better outcome than
+the discipline rev-2 was relying on, and it is worth noting as a general shape: a coupling you
+delete cannot be violated by the next person who does not read the warning.
 
 ### 6.2 Batch vs online — decision, with the arithmetic
 
@@ -1437,20 +1503,21 @@ a request to relax the constraint.
 | Stage | 5,013 rows | 50,000 rows | Basis |
 |---|---|---|---|
 | `s42` conflicts | < 1 s | ~5 s | dataframe work over clusters |
-| `s43` TF-IDF + 20 OvR LR × 5 folds | ~20 s | ~3 min | [estimate] |
+| `s43` TF-IDF + 20 OvR LR × 5 folds | ~20 s | ~2 min | [estimate] — the dominant term, roughly linear |
 | `s44` cleanlab over a `n×20` matrix | ~2 s | ~20 s | [estimate] |
-| `s45` embedding | **35 s** | **~6 min** | mE5-small INT8, 143.1 tickets/s @128 tok, 4 threads [measured, spec §4.5]; token p90 is 96 (cleaning §4.2) so 128 is the right column |
-| `s45` kNN (exact, brute force) | ~2 s | ~45 s | 5,013² × 384 ≈ 9.6 GFLOP; 50k² × 384 ≈ 960 GFLOP in BLAS [estimate] |
-| `s45` UMAP (diagnostic, once) | ~30 s | ~4 min | [estimate] |
-| **Total** | **~2.5 min** | **~12–15 min** | |
+| **Total** | **~25 s** | **~2 min** | |
 
-**No GPU, at 5k or at 50k.** The embedding pass is the only candidate and it is 6 minutes of
-CPU at ten times the current corpus size. A GPU becomes worth discussing at ~500k rows, or if
-tier 4 switches to a base-size encoder (26.1 tickets/s @256 [measured] ⇒ 50k in ~32 min —
-still not a GPU argument, just a slower coffee). Two caveats: exact kNN is O(n²) and should
-become an approximate index (`hnswlib`/`faiss`) above ~200k rows; and the §4.5 determinism
-pinning (`OMP_NUM_THREADS=1`) costs about 3× on the embedding pass [estimate], so pin it for
-the frozen build and leave it unpinned while iterating.
+**No GPU, and after the tier-4 cut there is nothing left that could even raise the question.**
+The three surviving tiers are sparse linear algebra and dataframe work.
+
+*Rev-2's version of this table was ~2.5 min / ~12–15 min, dominated by three `s45` rows. It
+also carried a number that was never measured: it claimed ~6 min to embed 50k rows on the
+basis of an ONNX INT8 throughput figure (143 rows/s) borrowed from the parent spec, when the
+build step producing that artifact had never been specified. The validation measured the
+actual path — fp32 `torch`, **59.5 s for 4,622 rows at 4 threads**, implying **~10.6 min at
+50k**, ~1.8× my figure. The row is deleted, but the lesson is not: a throughput number lifted
+from a different build configuration is an estimate wearing a [measured] tag, and I should
+have labelled it as such.*
 
 **Two non-obvious findings that change the design:**
 
@@ -1593,25 +1660,22 @@ one.
 | Split ratios, gap days, `org_purge_jaccard`, `seed_root` | `s51`→`s55` | $0 | — | ~1 min |
 | Review verdicts returned / a new round added | `s50`→`s55` | $0 | — | ~2 min |
 | Queue capacity, stratum shares, priority function | `s41`→ human → … | $0 | — | mins + human |
-| **Tier-4 `k`, distance metric, kNN params** | `s45`→`s46`→`s30`→… | **P3 re-issue if the residual set changes (~$5)** | ~5 s (embeddings cached) | ~1 h |
-| **Tier-3 parameters** | `s44`→`s46`→`s30`→… | as above | ~2 s | ~1 h |
+| **Tier-3 parameters** | `s44`→`s46`→`s30`→… | **P3 re-issue if the residual set changes (~$5)** | ~2 s | ~1 h |
 | **Tier-2 hyperparameters, `n_splits`, or the fold seed** | `s43`→`s44`→`s46`→`s30`→… | as above | ~20 s | ~1 h |
-| **Tier-4 embedding checkpoint or `revision`** | `s45`→… **and re-embeds everything** | as above | **~35 s** | ~1 h |
 | **`sklearn` / `cleanlab` version bump** | `s43`/`s44` onward — `params_sha256` is unchanged but the *fitted* hash is not, so this is caught, not missed (§4.8) | as above | ~25 s | ~1 h |
 | Phase-3 prompt, judge model, or `self_consistency` | `s30`→`s55` | **P3 only (~$2.60 single-vote, ~$5.20 escalating)** | — | ~1 h |
-| Phase-2 prompt or cleaner model | `s20`→`s55`, **and all four cheap tiers** (they read cleaned text) | **P2 (~$19) + P3 re-issue (~$5)** | ~2.5 min | ~2 h |
-| **`gold_ids.json` redrawn** | `s29`→ everything downstream. **Refused by default** — see §6.7 | full P3 | ~2.5 min | ~2 h |
-| **`ticketprep` normalisation or redaction (MAJOR)** | **everything**; all cache keys change because the rendered payload changes | **full (~$25)** | ~2.5 min | ~2–4 h |
-| A new raw export | everything | full | ~2.5 min | ~2–4 h + human |
+| Phase-2 prompt or cleaner model | `s20`→`s55`, **and all three cheap tiers** (they read cleaned text) | **P2 (~$19) + P3 re-issue (~$5)** | ~25 s | ~2 h |
+| **`gold_ids.json` redrawn** | `s29`→ everything downstream. **Refused by default** — see §6.7 | full P3 | ~25 s | ~2 h |
+| **`ticketprep` normalisation or redaction (MAJOR)** | **everything**; all cache keys change because the rendered payload changes | **full (~$25)** | ~25 s | ~2–4 h |
+| A new raw export | everything | full | ~25 s | ~2–4 h + human |
 
 Three readings of this table:
 
 - **The cheap tiers are cheap to iterate on and that is their second-biggest benefit.** Tuning
-  `k` or a cleanlab threshold costs seconds of CPU and, if the residual set is unchanged,
-  nothing at all in LLM spend. Tuning a judge prompt used to be the only knob and it cost
-  $45 a turn.
-- **Phase 2 got more expensive to change**, because tiers 2–4 read its output. That is a real
-  cost of the ordering decision in §2.2 and it is worth ~$5 and 2.5 minutes.
+  a cleanlab threshold costs seconds of CPU and, if the residual set is unchanged, nothing at
+  all in LLM spend. Tuning a judge prompt used to be the only knob and it cost $45 a turn.
+- **Phase 2 got more expensive to change**, because tiers 2–3 read its output. That is a real
+  cost of the ordering decision in §2.2 and it is worth ~$5 and 25 seconds.
 - **Everything below the tier rows is expensive and should be**: changing what the model
   *sees* must invalidate what the model *said*. Note the shape of the table after the
   re-costing: **the judge is no longer an expensive knob at all** — at $2.60–5.20 a turn it is
@@ -1711,7 +1775,7 @@ s20  (all rows — Phase 2 MUST run on gold rows: their text has to be
    ↓
 s29_gold_fence   draw (or load) the gold sample; write gold_ids.json; freeze; hash
    ↓
-s42 s43 s44 s45 s46 s30      input row set := all_rows \ gold_ids     ← hard assertion
+s42 s43 s44 s46 s30          input row set := all_rows \ gold_ids     ← hard assertion
 ```
 
 Five mechanics, each closing a specific way this leaks:
@@ -1756,17 +1820,22 @@ that freezes a corpus). Contents:
   **USD spent this build** and cumulative for this `dataset_version`, p50/p95 provider latency.
 - **The label-audit cascade** — this is the new section and it is the one people will read:
   rows flagged **per tier** and by the union; the **funnel** (`labelled → flagged by ≥1 tier →
-  routed to LLM → routed to human → changed`); tier **overlap matrix** (how often tiers 1–5
-  flag the same row, which is how you find out a tier is redundant); `t3_label_quality`
-  distribution; `t4_knn_agreement` distribution; **per-tier precision once review returns**
+  routed to LLM → routed to human → changed`); tier **overlap matrix** (how often tiers 1, 3
+  and 5 flag the same row, which is how you find out a tier is redundant); `t3_label_quality`
+  distribution; **per-tier precision once review returns**
   (fraction of each tier's flags a human agreed with); and `random_audit` results, which give
   the cascade's **miss rate**. A tier whose flags a human agrees with less often than the
   random-audit base rate is worse than nothing and should be turned off — that comparison is
-  only computable because both numbers are in this report.
+  only computable because both numbers are in this report, and **it is the comparison that
+  cut tier 4**, made there by a dedicated study only because this report did not exist yet.
 - **Corpus**: cluster-size histogram, split sizes, `org_overlap_rate`, per-service positive
   counts, cardinality histogram, RU:EN ratio, token-length distribution (spec §2.8's required
-  week-1 report, produced automatically rather than by hand).
-- **Gates**: id, threshold, observed, pass/fail, and whether it was `--force`d.
+  week-1 report, produced automatically rather than by hand), and the **per-service-pair
+  tier-2 confusion table** (both directions) + label co-occurrence — the taxonomy diagnostic
+  that replaces UMAP, computed from `t2_probs` at no extra cost.
+- **Gates**: id, threshold, observed, pass/fail, and whether it was `--force`d — including
+  **G-T1–G-T4 per active tier** (§5.3.1), so a tier that stops earning its slots shows up in
+  the routine report rather than requiring a dedicated study to find.
 - **Diff vs the previous build**: every count, side by side. *This is the artifact that
   catches a bad prompt change* — a Phase-2 edit that silently starts truncating descriptions
   shows up as a 20% shift in `char_len` p50 before it shows up in a model metric.
@@ -1797,10 +1866,10 @@ denylist filter is a security control, not an observability preference.
 | F-16 | Someone trains against `data/interim/` | **the exact failure C2 forbids** | interim schemas deliberately lack `split`, `sample_weight` and `label_provenance`; the trainer takes `--corpus <dir>` and asserts `manifest.frozen == true`. Training against a live query is impossible because there is no query |
 | F-17 | **A dedup cluster straddles a CV fold** (tier 2) | **silent, and it degrades tier 3's entire ranking** | folds are keyed on `dedup_cluster_id` (§4.5); a unit test asserts `n_clusters_straddling == 0`; the run report prints it. This is the failure most likely to make the cascade look like it works while ranking the wrong rows |
 | F-18 | **Tier-2 LR is degenerate** — a rare service with 15 positives gets an all-negative classifier | tier 3 ranks every positive of that service as suspect, flooding the queue with the rare tail we can least afford to lose | `s43` reports per-service AP and positives; services below `min_positives_for_tier2` (default 30) are **excluded from tiers 2–3 scoring** and carry `flag_reasons += tier2_insufficient_support`. They are still eligible for tiers 1, 4 and 5 |
-| F-19 | **Embedding checkpoint unavailable or its hash mismatches** | tier 4 only | build fails by default; `--skip-tier 4` proceeds with the skip recorded in the manifest. Never falls back to a different checkpoint automatically — a silently-substituted encoder changes the neighbourhood structure and nothing would say so |
+| F-19 | ~~Embedding checkpoint unavailable or hash mismatch~~ | — | **retired with tier 4 (C1c).** The whole failure mode disappears with the stage; there is no external model artifact left in the pipeline to be unavailable, stale or silently substituted |
 | F-20 | **A tier floods the queue** (a threshold change makes tier 3 flag 60% of rows) | reviewer time, and the other tiers get squeezed out | capacity caps per stratum (§5.4) bound this by construction; the run report shows requested-vs-granted per stratum so the squeeze is visible rather than inferred |
 | F-21 | **A gold row was scored by a tier** | **contaminates the only uncontaminated evaluation stream** | `s29` assertion + `s53` re-assert (§6.7). Hard fail, no `--force` |
-| F-22 | `dataset_version` changes with no semantic change (BLAS/thread drift in tiers 2–4) | trust in the version, which is the whole asset | §4.5: pin threads for frozen builds, round probabilities before ranking, and `ticketds verify` reports which columns differ so this is distinguishable from a real change in one glance |
+| F-22 | `dataset_version` changes with no semantic change (cross-CPU/BLAS drift in tiers 2–3) | trust in the version, which is the whole asset | §4.5: round `t2_probs` before ranking (the mitigation that carries this), pin threads for frozen builds, and `ticketds verify` reports which columns differ so this is distinguishable from a real change in one glance. **Note the hazard is smaller than rev-2 claimed** — thread count alone was measured bit-identical; the untested risk is cross-CPU |
 
 ---
 
@@ -2028,8 +2097,8 @@ Collected; the reasoning is in the section named.
 | **Tier ordering (§2.2)** | conflicts → CV probs → cleanlab → kNN → LLM → human | LLM-first with cheap tiers as a *filter on its output* — inverts the cost curve and gives the expensive instrument the un-triaged set; running tiers in parallel and unioning without an order — loses the "tier 1 is provably right" property that lets it bypass the caps |
 | **CV fold grouping (§3.4)** | `dedup_cluster_id` | `ticket_id` (the leakage bug: a row's near-duplicate trains the fold that scores it); `organization_id` (repeats the §3.5 infeasibility inside CV, with no temporal constraint forcing it and no measured benefit) |
 | **Tier-3 implementation (§4.8)** | `cleanlab`, multi-label API | `cleanlab`'s **multi-class** API — silently assumes one correct label per row and would flag every 2–4-service ticket; **hand-rolling the confident-joint rank** — buys nothing, since `cleanlab` is maintained, tested and Apache-2.0, and the edge cases it handles are exactly the ones a 50-line reimplementation gets wrong |
-| **Embedding matrix location (§3.4)** | a side `.npy` keyed to row order, hashed in the manifest | a `list<float32>[384]` corpus column — triples corpus size for something no consumer of the corpus reads |
-| **UMAP's role (§3.4)** | once-only human diagnostic, never a routing input | using the 2-D projection to select rows for review — the layout depends on its own seed and neighbourhood parameters, and routing humans on a stochastic projection is not defensible |
+| **Tier 4 — embedding kNN + UMAP (C1c, §3.4)** | **cut entirely** | keeping it as specified — measured *worse* at matched reviewer budget (0.589 vs 0.683 at 185 rows) and failing the ablation control; **downgrading to TF-IDF cosine** — also dominated (0.241 at 185 rows), so it would keep a useless flag list and merely make it cheap; **keeping UMAP as diagnostic-only** — the free tier-2 pair-confusion table is the better instrument for the same question. If it is ever reinstated it must clear validation §5's gate: tier-3 top-N ∪ tier-4 top-M must beat tier-3 top-(N+M), ≥3 seeds, non-overlapping spreads |
+| **Taxonomy diagnostic (§3.7, §7.1)** | per-service-pair tier-2 confusion + co-occurrence, quantitative | a UMAP scatter plot — stochastic layout, no action threshold, and it costs a JIT toolchain (`numba`/`llvmlite`) to produce |
 | **Self-consistency (§6.2, §6.6)** | **escalating ≤3 votes** on the measured 288-row residual (~375–600 calls, $5.18) | 1 vote over the whole corpus (rev-1's answer — 9× the cost and a weaker instrument); **unconditional 3 votes** on the residual (864 calls, $7.78 — 288 of them on rows the first pass already cleared); N-of-M by temperature (rejected on current models, fallback §4.2) |
 | **Judge input sizing (§6.2)** | measured demand (288), with `judge.max_rows` = 1,500 as a **non-binding backstop** | a score threshold with no cap — makes a threshold tweak into an unbudgeted spend, the same failure the review capacity cap exists to prevent; sizing from my rev-2 1,400-row *estimate* — superseded by cleaning §4.3's measurement |
 | **Secret scanning in the data path (§8.2)** | **removed** (C10) | keeping `gitleaks`/`detect-secrets`/entropy "just in case" — [measured, cleaning §2.4] 0/81 URL tokens exceed the base64 entropy limit and 40% fall below the hex limit, so it neither works nor has a threat to work on. Retained **only** as a pre-commit guard on our own source tree (§8.5) |
@@ -2053,7 +2122,7 @@ marked `frozen: false` until the gates are real".
 | **5b** | **`s29_gold_fence`** — `gold_ids.json` with `count: 0`, the complement helper, the assertion, and the `s53` re-assert | **the fence exists before the first tier that could violate it.** It is a no-op today and that is precisely why it must be built now (§6.7) | 5 |
 | **5c** | **`s42_label_conflicts`** (tier 1) | [measured] 71 flagged rows on the fixture, free and provably correct. First label-quality signal in the project | 5b |
 | **5d** | **`s43_cv_probs`** (tier 2) — grouped folds, TF-IDF + OvR LR, `t2_probs`, plus the `n_clusters_straddling == 0` test | this stage **also discharges the parent spec §3 TF-IDF baseline requirement**, so it is not cascade-only work | 5c |
-| **5e** | **`s44_confident_learning`** (tier 3) + **`s45_knn_agreement`** (tier 4) + `s46_triage` + `label_audit.parquet` | **a full label-quality report with no LLM anywhere in it** — see the note below | 5d |
+| **5e** | **`s44_confident_learning`** (tier 3) + `s46_triage` + `label_audit.parquet` + the tier-2 taxonomy confusion table | **a full label-quality report with no LLM anywhere in it** — see the note below | 5d |
 | **6** | The LLM layer: provider seam, cache, executor, online mode; `s20_llm_clean` behind `--limit 200` | prompt iteration is possible; costs pennies | 5, and the Phase-2 prompt + schema (D-1) |
 | **7** | Batch execution path; full-corpus `s20` | Phase 2 complete on 5,013 rows; cache warm | 6 |
 | **8** | `s55_freeze` + `ticketds verify` + the CI job that rebuilds and asserts `dataset_version` stability | **reproducibility is now testable, not claimed** | 5 |
@@ -2068,15 +2137,25 @@ they have no LLM dependency at all, and they end with a complete label-quality r
 
 Before the cascade, the LLM-free envelope stopped at step 5 — a corpus with clean text,
 splits and gates, but nothing said about whether the *labels* were any good. Now the envelope
-extends through tier 4, which means the project can answer "how much label noise is in this
+extends through tier 3, which means the project can answer "how much label noise is in this
 corpus, where is it concentrated, and which services are affected" **before spending a cent on
 an LLM, before writing a judge prompt, and before legal has to answer whether ticket text may
 leave the perimeter at all**. Concretely, after step 5e and with no API key configured, we
 have: [measured] 71 provably-conflicting rows, a ranked mislabel list, a per-service
-label-quality profile, a kNN agreement distribution, and the UMAP taxonomy diagnostic that
-shows whether `auth` and `access-control` are separable at all. If that report says label
-noise is negligible, **Phase 3 may not be worth building** — and that is a finding worth
-reaching in week 2 for free rather than in week 5 for $25 and a prompt-engineering cycle.
+label-quality profile, and the tier-2 pair-confusion table that shows whether `auth` and
+`access-control` are separable at all. If that report says label noise is negligible,
+**Phase 3 may not be worth building** — and that is a finding worth reaching in week 2 for
+free rather than in week 5 for $25 and a prompt-engineering cycle.
+
+**Cutting tier 4 strengthens this milestone rather than weakening it.** The deliverable is
+unchanged — every item in that list survives, because the one tier-4 output that appeared in
+it (the UMAP plot) is replaced by a table computed from `t2_probs` that answers the same
+question quantitatively. What changes is the price of getting there: the milestone drops from
+~2.5 min to **~25 s** of CPU, loses a 471 MB checkpoint download and a mirror, and sheds
+`torch`, `transformers`, `sentence-transformers` and `umap-learn` from the environment a
+developer must install to reach it. **A milestone whose whole argument is "this arrives early
+and cheaply" is exactly the place where removing 1.2 GB of dependencies is worth saying out
+loud.**
 
 It also de-risks the two dependencies most likely to slip: the cleaning spec's judge prompt
 (D-1) and legal's answer on sending ticket text to a third party (D-3). Neither blocks
@@ -2101,12 +2180,14 @@ runs, **and** D-3 has been answered.
 | **D-3** | **May pseudonymised ticket text go to a hosted LLM API?** Phase 1 removes direct identifiers, but the text is still customer-authored and the residual re-identification risk is not zero | Legal / DPO | Blocks step 7 for production data; **does not block anything on the synthetic fixture**, which is invented text. Config defaults to `external_llm: denied`, and step 13 is built in parallel so a "no" costs a week rather than a redesign. **Do not run Phase 2 on a production export before this lands.** Give legal the concrete artifact rather than the abstract question: a sample of post-`s12` redacted rows and the §8.2 gate criteria, so they are ruling on what would actually be sent |
 | **D-3b** | **Is a self-hosted model available inside the perimeter, on what hardware, and who operates it?** This is the fallback D-3 depends on | Infra | Needed only if D-3 is "no", but **scope it now** — an unavailable fallback turns a config change into a procurement cycle. Fallback-policy §3 shows the volume is undemanding; the open questions are host, ownership and on-call, not feasibility |
 | **D-4** | **"At most one LLM call per row" — one *attempt* or one *accepted response*, and is it per phase?** (§1.4c, §6.2) | user | **Two separate readings, both needed, and neither is a request to relax the constraint.** (a) *One accepted response*, 3 attempts max, `1.05 × rows` budget per run — one-attempt-only sends ~0.2–0.5% of rows [estimate] to the human queue for a formatting reason, wasting reviewer time on a machine problem. (b) **The constraint is scoped per phase.** It bounds Phase 2 at one call per row over all 5,013 rows. Phase 3's escalating self-consistency is **up to three accepted responses per judged row by design**, and that is a separate budget line — it covers a [measured] 288 rows, so ~576 calls over 4,622 labelled rows = **0.12 calls/labelled row**, an order of magnitude *under* the Phase-2 budget. Cleaning §4.3.9 reads it the same way |
-| **D-5** | **Reviewer capacity — a much smaller ask than the last revision claimed.** ~200 queue rows × 2.5 min ≈ **8 h**, ~**25 h** including the calibration pilot and per-phase validation, *additional* to the runbook §4.2 gold-set 70 h | Support lead | Both my earlier figures (12.5 h) and proposal §7.1's reconciliation (~44 h) are withdrawn; cleaning §4.3.11's measured tier-selection counts supersede them. **The binding input is no longer reviewer availability — it is the real base reject rate**, which is unknown until tiers 1–3 run on the production export (four minutes of CPU, no human, no LLM). Ask for a *provisional* 25 h and re-derive before committing; the realistic contaminated-column case is ~400–700 rows ≈ 17–29 h. The 600-row cap stays as a non-binding backstop |
+| **D-5** | **Reviewer capacity.** ~285 queue rows × 2.5 min ≈ **12 h**, ~**28 h** including the calibration pilot and per-phase validation, *additional* to the runbook §4.2 gold-set 70 h | Support lead | Both my earlier figures (12.5 h) and proposal §7.1's reconciliation (~44 h) are withdrawn; cleaning §4.3.11's measured tier-selection counts supersede them. **The binding input is no longer reviewer availability — it is the real base reject rate**, which is unknown until tiers 1–3 run on the production export (~25 s of CPU, no human, no LLM). Ask for a *provisional* 28 h and re-derive before committing; the realistic contaminated-column case is ~400–700 rows ≈ 17–29 h. The 600-row cap stays as a non-binding backstop and absorbed this revision's 43% demand increase without moving |
+| **D-5b** | **The tier-3 selector width (`score < 0.30`, 315 rows) is set on the fixture and is the main lever on the reviewer ask.** Widening it from `< 0.20` bought +14pp/+9pp injected-error recall and cost ~85 queue rows | ML + support lead | Keep `< 0.30` for the fixture — it is where the mask stops adding rows the score cut has not already taken, which is a principled stopping point rather than a tuned one. **Re-derive it on the real export's flag rate before committing reviewer time**, in the same run that answers D-5. This is a genuine trade (recall per reviewer-hour) and it should be settled by whoever owns the hours, not silently by a threshold in a config file |
 | **D-6** | **Raw-export retention: 30 days post-freeze** (§8.3) — **the answer is unchanged by C10 but the recorded reason changes** | Legal + DPO + ML | 30 days, justified by **personal-data minimisation and irreversibility**, not by credential exposure (which C10 removed). §8.3 shows the reasoning. I would accept 90 days for the *first* production build only, auto-expiring and recorded in the manifest, on the grounds that the first run is the one most likely to need raw re-derivation while detectors are still being tuned |
-| **D-7** | **Model tier: Sonnet 5 (P2) + Opus 5 (P3); ~$22/build single-vote, ~$25 with escalating self-consistency** (§6.2) | ML + whoever owns the budget | As proposed, **and take the self-consistency** — it costs $2.60 more and is a materially better instrument. Note the shape of the bill after re-costing against the measured 288-row residual: **Phase 2 is ~79% of it and the judge is ~$5**. Any effort to reduce LLM spend belongs on Phase 2. Revisit the tier only if per-tier precision (step 11) shows the judge adding nothing over tiers 1–4 — in which case the right move is to cut the judge entirely (D-13), not to downgrade it |
+| **D-7** | **Model tier: Sonnet 5 (P2) + Opus 5 (P3); ~$22/build single-vote, ~$25 with escalating self-consistency** (§6.2) | ML + whoever owns the budget | As proposed, **and take the self-consistency** — it costs $2.60 more and is a materially better instrument. Note the shape of the bill after re-costing against the measured 288-row residual: **Phase 2 is ~79% of it and the judge is ~$5**. Any effort to reduce LLM spend belongs on Phase 2. Revisit the tier only if per-tier precision (step 11) shows the judge adding nothing over tiers 1–3 — in which case the right move is to cut the judge entirely (D-13), not to downgrade it |
 | **D-8** | **`allow_unpartitioned_eval` for the fixture.** The fixture has no `ticket_messages`, so no label in it is verifiably human (§1.2) | ML | `true` for the fixture only, with `provenance_complete: false` banner-printed in every report. **Never** for a production build — that flag existing at all is a risk, and it should be `false` in `pipeline.default.yaml` |
 | **D-9** | Does the eventual real input arrive as a CSV export or a read-replica query? | Backend / DBA | Either works; a query needs `export_query_sha256` populated and the query text archived. **A live query with no snapshot is the one thing C2 forbids** |
 | **D-10** | Repo layout `py/` vs the brief's `pipeline/` (§1.4d) | user | `py/`. Cheap to change now, expensive after 200 imports exist |
-| **D-11** | **Tier-4 embedding checkpoint.** Which checkpoint, pinned at which commit SHA, mirrored where? (§4.8) | ML + infra | `intfloat/multilingual-e5-small` (MIT, 118 MB INT8), pinned by commit SHA, served from an internal mirror. **Inference must be local with no network access during `s45`** — the config deliberately has no field for a hosted embedding endpoint. Keep it decoupled from the production classifier checkpoint (§6.1): coupling them makes the label audit of a corpus depend on the model that corpus trained |
-| **D-12** | **Determinism vs wall-clock on tiers 2–4.** Pinning `OMP_NUM_THREADS=1` costs ~3× on the embedding pass; not pinning it means `dataset_version` can change with no semantic change (§4.5, F-22) | ML + me | Pin for any build that will be frozen or cited; leave unpinned while iterating. Round `t2_probs` to 6 significant digits before ranking and hashing. This is a genuine new cost of putting fitted models in a previously bit-deterministic pipeline and it should be a conscious choice, not a surprise in CI |
+| ~~**D-11**~~ | ~~Tier-4 embedding checkpoint~~ | — | **Closed by [`knn-tier-validation.md`](./knn-tier-validation.md): there is no checkpoint.** Tier 4 is cut (C1c), so the questions of which encoder, which commit SHA, which mirror and which egress assertion all disappear rather than being answered |
+| **D-12** | **Determinism vs wall-clock on tiers 2–3** (§4.5, F-22) — *shrunk to the sklearn-only case* | ML + me | Round `t2_probs` to 6 significant digits before ranking and hashing — **this is the mitigation that carries the risk**, and it covers the cross-CPU case that pinning does not. Pin `OMP_NUM_THREADS=1` for frozen builds too; it now costs seconds rather than minutes. **Note what the validation falsified**: rev-2 justified a 3× wall-clock tax against a thread-count hazard that was then measured **bit-identical** at 1 vs 4 threads. The residual risk is cross-CPU and untested. I would rather record that I priced an unmeasured hazard than quietly drop the paragraph |
 | **D-13** | **Does the cheap-tier report alone settle whether Phase 3 is worth building?** (§10, cleaning §4.3.12) | ML | Decide *after* step 5e and before step 9, on cleaning §4.3.12's measured rule (`P_cheap`, `Yield_judge`) rather than on taste. If it fires, **do not build the judge** — the cascade will have paid for itself by preventing work, and the corpus gains zero model-provenance labels from this pipeline (§3.6) |
+| **D-14** | **OOD signal hand-off.** `t4_dist_to_centroid` was providing the embedding-distance OOD signal that [`llm-fallback-policy.md`](./llm-fallback-policy.md) §2 case 4 requires; tier 4 is cut, so nothing in this pipeline provides it (§3.4) | ML (classifier spec + fallback policy owner) | **The requirement is real and must be re-homed, not dropped.** It belongs at serving time: the threshold is set on the *production model's* validation set and `model_service` already has that encoder loaded, so it is one vector operation against a 20-centroid table shipped with the model artifact alongside `thresholds.json`. Concretely: add the centroid table to classifier spec §9.1's artifact list and move the check into the model service. **I have deliberately not edited those documents** — they are merged and outside this branch, and silently editing a merged spec is how requirements get lost twice |
