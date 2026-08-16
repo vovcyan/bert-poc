@@ -91,10 +91,10 @@ backups×managed-postgres, access-control×auth, console-ui×the broken componen
 |---|---|
 | distinct titles (exact) | 3,905 / 5,013 = **0.779** |
 | distinct descriptions (exact) | 5,007 / 5,013 = **0.999** (6 duplicate descriptions under different titles; 0 duplicate title+description pairs) |
-| char-5-gram Jaccard ≥ 0.80 | 560 pairs, **1 unintended pair** (2 rows) — the rest are the intentional alert-template clique and copy-paste clusters; largest intentional cluster 25 rows |
-| char-5-gram Jaccard ≥ 0.60 | 5,074 pairs total; **136 unintended** (excluding intentional clusters and incident bursts), covering 254 rows (5.1%), **largest unintended cluster 5 rows** |
-| RU + code-switched descriptions | 99,938 tokens, 5,397 distinct, TTR 0.054, 1,099 hapax |
-| EN descriptions | 49,380 tokens, 2,320 distinct, TTR 0.047, 600 hapax |
+| char-5-gram Jaccard ≥ 0.80 | 560 pairs, **1 unintended pair** (2 rows) — the rest are the intentional alert-template clique and copy-paste clusters; largest intentional cluster 25 rows. Unchanged by the payload pass |
+| char-5-gram Jaccard ≥ 0.60 | 5,008 pairs total; **71 unintended** (excluding intentional clusters and incident bursts), covering 133 rows (2.7%), **largest unintended cluster 4 rows**. The payload pass *reduced* this from 136 pairs / 254 rows, because every pasted block is unique |
+| RU + code-switched descriptions | 155,307 tokens, 7,459 distinct, TTR 0.048, 2,331 hapax |
+| EN descriptions | 69,883 tokens, 3,209 distinct, TTR 0.046, 1,039 hapax |
 | repeated boilerplate | 135 sentences occur ≥20× each and account for **47.9% of all sentence instances** — the generic "moves" (`Мешает работать, но не блокирует.`, `Do not reply to this message…`). Scenario-specific sentences carry the signal; this filler is the compositional seam, and it is visible in aggregate even though individual rows read naturally |
 | distinct scenarios per service | billing 141, console-ui 137, auth 119, api-gateway 111, access-control 109, compute 107, object-storage 104, subscriptions 92, monitoring 80, networking 79, notifications 69, managed-postgres 68, logging 55, integrations 52, backups 43, managed-redis 19, dns 18, cdn 17, message-queue 12, terraform-provider 7 |
 
@@ -102,12 +102,12 @@ backups×managed-postgres, access-control×auth, console-ui×the broken componen
 
 - **Service hygiene** (the reason `norm_services()` exists): 49 rows with a space around the comma (`"logging, subscriptions"`),
   38 with mixed case (`"Billing"`), 40 with an internal duplicate (`"logging,logging"`).
-- **Text**: 374 descriptions with embedded newlines (log/traceback/e-mail-quote pastes), 246 rows with embedded `"` (escaped
-  `""`), 341 with `;` and ~4,100 with `,` inside prose, 119 ALL-CAPS titles, 337 lowercase-initial titles, 207 rows with
+- **Text**: 1,771 descriptions with embedded newlines (log/traceback/e-mail-quote pastes), 814 rows with embedded `"` (escaped
+  `""`), 341 with `;` and ~4,100 with `,` inside prose, 119 ALL-CAPS titles, 337 lowercase-initial titles, 218 rows with
   leading/trailing whitespace, plus character-level typos (doubled/transposed letters, dropped commas, `ё`→`е`) on ~15% of rows.
-  Description length 22–793 chars (median 186); 262 tickets under 80 chars.
-- **PII to pseudonymise (§2.9)**: 265 e-mail addresses, 179 phone numbers, 76 card-like digit runs, 210 URLs of which 108 carry
-  a token or key, plus several hundred invented personal names, legal-entity names and INNs.
+  Description length 24–1,691 chars (median 222, p75 440, p90 688, p99 1,040); 232 tickets under 80 chars.
+- **PII to pseudonymise (§2.9)**: 566 e-mail addresses, 287 phone numbers, 89 card-number strings, 568 URLs, plus several hundred
+  invented personal names, legal-entity names and identifiers. Most of this now sits inside pasted payloads — see the next section.
 - **Near-duplicates (§4.3)**: 99 auto-generated monitoring-alert tickets sharing one template across 60 organisations (the
   ≥0.80 clique), 72 rows in 26 copy-paste refile clusters where one customer re-filed the same ticket with a "пишу повторно"
   line appended, plus the legacy `docs-org11` / `key403-org19` / `pgpool-org7` clusters. Semantic-but-not-lexical clusters
@@ -121,6 +121,57 @@ backups×managed-postgres, access-control×auth, console-ui×the broken componen
   most with empty `services`. Row sources overall: 310 legacy hand-written, 358 burst, 99 auto-alert, 72 copy-paste refile,
   ~4,170 scenario-bank.
 
+## Pasted payloads (30% of rows)
+
+Real support tickets carry pasted material, and a redaction/pseudonymisation pipeline (§2.9) has to survive it.
+**1,500 rows (29.9%) carry at least one pasted payload**; 334 of them carry two or three. There are **1,857 payload
+instances, every one textually unique** (ids, timestamps, hostnames, amounts, stack frames and key bodies are all varied).
+
+| Category | Instances | What it looks like |
+|---|---|---|
+| Logs / stack traces | 795 | Python tracebacks, Java stack traces, Go panics, nginx access+error lines, systemd/journalctl, k8s event tables, PostgreSQL error+statement pairs, browser console errors, postfix/SMTP lines, docker OOM kills, cron output |
+| Code and config | 407 | `curl` invocations, Python/JS/Go fragments, `EXPLAIN` SQL, Terraform HCL, docker-compose, nginx.conf, k8s manifests, `.env` pastes, CI YAML, redis-cli output, DNS zone files |
+| Internal infrastructure ids | 175 | hostnames, private IPs and CIDRs, k8s namespace/pod names, cluster/project UUIDs, bucket and queue names, internal Jira/Confluence URLs |
+| HTTP request/response dumps | 183 | full header blocks with `Authorization:`, cookies, `X-Request-Id`, trace ids, idempotency keys, webhook deliveries with `X-Signature` |
+| Bank / transactional | 109 | card PAN + expiry/CVV, RU р/с + к/с + БИК + п/п, IBAN/SWIFT-BIC, payment/transaction/RRN/auth codes, acquiring and 3-DS decline dumps, invoice/акт/договор numbers |
+| PII | 99 | full names, DOB, home addresses, passport, СНИЛС, personal e-mail and mobile, Telegram handles, and entire forwarded customer e-mails with signature blocks |
+| Application secrets | 61 | API keys, bearer tokens, JWTs, OAuth client secrets, webhook signing secrets, DB connection strings with inline passwords, S3 access-key/secret pairs, PEM private-key blocks, SSH keys, basic-auth URLs |
+| Company identifiers | 28 | ИНН, КПП, ОГРН/ОГРНИП, legal names, VAT/registration numbers, D-U-N-S, contract numbers |
+
+Placement and mess are varied deliberately: pastes appear appended at the end or spliced mid-description after a lead-in
+("прикладываю лог", "вот наш конфиг", "attaching the traceback") matched to the payload type, or quoted inside a forwarded
+e-mail. **240 rows** carry the customer's own line numbers, **174** have `>`-quoted blocks, **155** are truncated mid-line,
+some are soft-wrapped by a mail client, and **9** are Windows-1251 mojibake. **173 rows contain partial self-redaction** —
+the customer masked their own secret inconsistently (`sk_test_51H***REDACTED***`, `карта 4111 11** **** 1111`,
+`пароль: ******`) — which is exactly the input a redaction pipeline must not choke on.
+
+Payloads match the ticket's topic and services (a `billing` ticket gets a payment decline dump, not a k8s manifest), and
+**no `services`, `labels`, `flags`, id or timestamp was changed by this pass** — only `description`.
+
+### Safety construction — nothing here is live
+
+This file is public in a git repository, so every value is non-functional and deliberately implausible as real data:
+
+- **IP addresses**: only RFC 5737 documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`),
+  RFC 3849 (`2001:db8::/32`) and RFC 1918 private ranges. An automated audit confirms **zero routable addresses**.
+- **Domains**: only `example.com` / `example.ru` / `example.org` / `example.net` / `*.invalid`. Zero non-example hosts.
+- **Card numbers**: only the universally published test PANs (`4111 1111 1111 1111`, `5555 5555 5555 4444`,
+  `4000 0000 0000 0002`) plus 85 masked/partial forms. A Luhn sweep guarantees that **no other 13–19 digit run in the file
+  passes the Luhn check** — several ОГРН/account numbers that accidentally did were nudged until they failed.
+- **Cloud and payment keys**: AWS's own documentation values (`AKIAIOSFODNN7EXAMPLE`,
+  `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`) and `sk_test_`/`whsec_` prefixes with obviously fake bodies.
+- **ИНН (96), ОГРН/ОГРНИП (19), СНИЛС (13) have deliberately INVALID check digits.** They are structurally correct and
+  arithmetically wrong, so none of them can correspond to a real person or company. This is verified programmatically.
+- **Passport and driving licence**: impossible series `00 00`. **IBANs**: check digits `00`, which is never valid.
+  **БИК**: the unissued `0499xx` range. **BIC/SWIFT**: invented `EXMP…`/`TEST…` codes.
+- **PEM blocks, SSH keys, JWTs**: bodies are literal placeholders (`EXAMPLEKEYDONOTUSE`,
+  `EXAMPLE-SIGNATURE-DO-NOT-USE`); the JWT payload base64-decodes to `"note": "EXAMPLE TOKEN - NOT VALID - DO NOT USE"`.
+- **Phones**: `+7 900 000-xx-xx` and `+1 555 01xx` reserved ranges. **Names, companies, addresses**: invented.
+
+The trade-off is explicit: where realism and obvious-fakeness conflicted, obvious-fakeness won. A grep for
+`EXAMPLE`/`DO-NOT-USE` will hit most secret material, so a redaction pipeline tested only on this file may look better than
+it will on production text.
+
 ## Known gaps before you rely on it
 
 - No `ticket_messages` rows, so §1/§2.1 provenance reconstruction cannot be exercised end to end — only the `tickets` side.
@@ -128,6 +179,8 @@ backups×managed-postgres, access-control×auth, console-ui×the broken componen
 - Labels are author-assigned, not blind-annotated: there is no inter-annotator agreement, so no α, and the file cannot stand in
   for the gold set (2,000 test + 1,000–1,500 val, runbook §4.2). Any accuracy number measured on it describes the generator,
   not the world.
+- Pasted payloads are template-driven with randomised values (unique per instance, but drawn from ~60 templates), so a
+  detector trained on them will learn those templates, not the shape of real pastes.
 - Surface realisation is compositional (see "Provenance of the text"), so lexical statistics — TTR, n-gram entropy, vocabulary
   growth — are lower than a real corpus of this size would show. Structural statistics (label balance, cardinality, timing,
   duplication) are the ones that transfer.
