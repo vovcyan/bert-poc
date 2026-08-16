@@ -90,7 +90,7 @@ All figures [measured] on the fixture.
 | **3** | `cleanlab` 2.9.0 confident learning | seconds | **none** | **315 rows** |
 | ~~4~~ | ~~embedding kNN + UMAP~~ | — | — | **cut — see §4.4** |
 | **5** | LLM judge, constrained adjudication with evidence spans | ~375–600 calls | **real** | **288 rows = 6.2%** |
-| **6** | Human review | ~11 person-hours | none | **~285 rows** |
+| **6** | Human review | ~12 person-hours | none | **~285 rows** |
 
 Tier numbering is kept with tier 4 struck rather than renumbered, because renumbering would
 invalidate cross-references in three documents for no benefit.
@@ -227,7 +227,9 @@ One thing is deliberately **not** lost: the distance-to-centroid value was doubl
 out-of-distribution signal for [`llm-fallback-policy.md`](../specs/llm-fallback-policy.md) §2 case
 4. That requirement is real, but it is a **serving-time** signal whose threshold belongs on the
 production model's validation set — and the production classifier already has an encoder. It is
-handed off explicitly rather than deleted.
+handed off explicitly rather than deleted: the concrete ask is a 20-centroid table added to
+classifier spec §9.1's artifact list, with the check moved into the model service, which already
+has that encoder loaded and needs one vector operation. **D-9 needs an owner assigned.**
 
 ### 4.4 Getting the statistics right
 
@@ -287,7 +289,7 @@ specs.
 | Rebuild after a code-only change | **$0** | Every response served from the replay cache |
 | Re-run the judge after a threshold tweak | **$2.60–5.20** | See below |
 | Machine | **~2 min CPU** for the cheap tiers; **2–4 h elapsed** overall | Elapsed time is batch turnaround, not compute. 4 vCPU, 8 GB RAM, **no GPU, and no model checkpoint to pin or mirror** |
-| Human | **~28 person-hours**, of which ~11 h is the review queue | Balance is the Phase-3 calibration pilot and per-phase pipeline validation |
+| Human | **~28 person-hours**, of which ~12 h is the review queue | Balance is the Phase-3 calibration pilot and per-phase pipeline validation |
 
 **Cost is not a decision variable.** A full build costs less than an hour of engineering time. Any
 review argument beginning "to save on LLM calls" should be treated with suspicion.
@@ -387,7 +389,7 @@ shrinks and the *handling* controls do not:
 | **D-3** | **Is a self-hosted LLM available in-perimeter, and at what tier?** | Infra | Needed only if D-1 is "no". The provider seam makes it a config change |
 | **D-4** | **"At most one LLM call per row" — one *attempt* or one *accepted response*, and is the budget scoped per phase?** | User | One accepted response, 3 attempts max; one-attempt-only routes ~0.2–0.5% of rows to a human for a *formatting* failure, spending reviewer time on a machine problem. And **scoped per phase**: the judge's escalating self-consistency is up to three accepted responses per judged row by design. The arithmetic makes the case better than the argument — ~576 calls over 4,622 labelled rows is **0.12 calls per labelled row**, an order of magnitude under the Phase-2 budget it would be compared against. This is a confirmation request, not a request to relax anything |
 | **D-5** | **Run tiers 1–3 on a real export in week 1** to get the true label-noise rate | ML | Do it first. Four minutes of CPU, no LLM, no human, no approval — and it sizes everything downstream, including whether Phase 3's LLM tier is worth building |
-| **D-6** | **Human budget: ~28 person-hours (~11 h queue), in addition to the ~70 h gold set** | Support lead | Confirm. **If only 70 h exist in total, spend all of it on the gold set and drop Phase 3.** Do not fund the queue out of the gold budget. The queue size is a deliberate trade (§4.4) and should be re-settled against the real export's flag rate rather than the fixture's |
+| **D-6** | **Human budget: ~28 person-hours (~12 h queue), in addition to the ~70 h gold set** | Support lead | Confirm. **If only 70 h exist in total, spend all of it on the gold set and drop Phase 3.** Do not fund the queue out of the gold budget. The queue size is a deliberate trade (§4.4) and should be re-settled against the real export's flag rate rather than the fixture's |
 | **D-7** | **Amend runbook §6** — org-grouped temporal splitting is infeasible (§7.1) | ML + product | Adopt the measured replacement and edit the runbook |
 | **D-8** | **Who authors the `auth` vs `access-control` tie-break rules?** | Product owner | Without written rules, judge and reviewer disagree on the same rows forever. This is the taxonomy's largest error source |
 | **D-9** | **The out-of-distribution signal for the LLM fallback needs a new home** | ML | Cutting tier 4 removes the distance-to-centroid value that was incidentally serving [`llm-fallback-policy.md`](../specs/llm-fallback-policy.md) §2 case 4. The requirement stands; it belongs at **serving time**, where the production classifier already has an encoder and the threshold can be set on that model's validation set. It never belonged in a dataset pipeline. Track it against the classifier spec, not this one |
