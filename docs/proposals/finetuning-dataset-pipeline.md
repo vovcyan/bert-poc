@@ -5,11 +5,12 @@ Date: 2026-08-16
 Companion documents:
 - [`docs/specs/dataset-pipeline-cleaning.md`](../specs/dataset-pipeline-cleaning.md) — text processing, label auditing, adjudication (the *semantics*)
 - [`docs/specs/dataset-pipeline-architecture.md`](../specs/dataset-pipeline-architecture.md) — stages, contracts, freezing, orchestration (the *runtime*)
+- [`docs/specs/knn-tier-validation.md`](../specs/knn-tier-validation.md) — the adversarial validation that cut the embedding tier
 
 This document is the decision-level summary: what we are building, what it costs, and what has
 to be decided before anyone writes code.
 
-**Nothing has been implemented.** All three documents are designs. No pipeline code, no configs,
+**Nothing has been implemented.** All four documents are designs. No pipeline code, no configs,
 no `.py` files exist in this repo.
 
 ---
@@ -23,8 +24,7 @@ response cache** that makes every re-run free and every published number re-deri
 calling a model provider at all. The deterministic phase does most of the work at **0.09 ms/row
 [measured]**, removing 48.2% of sentence instances as boilerplate at 1.2% collateral damage. Label
 auditing is a ladder of instruments ordered by cost: duplicate-conflict detection, a
-cross-validated TF-IDF baseline, confident learning, embedding-neighbour agreement, and only then
-an LLM judge — which on this corpus sees **6.2% of labelled rows [measured]** rather than all of
+cross-validated TF-IDF baseline, confident learning, and only then an LLM judge — which on this corpus sees **6.2% of labelled rows [measured]** rather than all of
 them. Human review lands at **~200 rows and ~25 person-hours [measured on the fixture]**, and the
 whole build costs tens of dollars.
 
@@ -72,7 +72,7 @@ cost. Reinstating the tier would be a version bump and a re-run, not a redesign.
 | **0 — ingest** | CSV → Arrow, canonicalise, snapshot hash | no | free | arch §3.1 |
 | **1 — deterministic** | Unicode/`ftfy` repair, whitespace and quote normalisation, `services`/`labels` hygiene, boilerplate and signature stripping, log-skeleton removal, PII → stable placeholders, language ID, length filters, **egress gate** | **no** | **0.09 ms/row** [measured] | cleaning §4.1 |
 | **2 — bounded LLM** | ≤1 accepted call/row: span classification, rule mining, row metadata, residual-PII second opinion. **Emits no prose** | 1/row | ~$19 [estimate] | cleaning §4.2 |
-| **3 — label audit** | Six tiers, cheapest first (below) | residual only | small | cleaning §4.3 |
+| **3 — label audit** | A cascade of instruments, cheapest first (below) | residual only | small | cleaning §4.3 |
 | **4 — corpus-level** | Dedup, temporal split with gap, class balance, quality gates, freeze | no | free | arch §3.5–3.7 |
 
 **Phase 4 is an addition to the requested three, and it is mandatory.** Dedup, split assignment,
@@ -88,11 +88,14 @@ All figures [measured] on the fixture.
 | **1** | Graded label conflicts within duplicate groups | seconds | **none** | ~14 queued (9 clusters / 71 rows carry disagreeing label sets) |
 | **2** | TF-IDF + one-vs-rest LR, `GroupKFold` on dedup clusters | **113 s CPU** | **none** | feeds tiers 3 and 5 |
 | **3** | `cleanlab` 2.9.0 confident learning | seconds | **none** | **161 rows** |
-| **4** | kNN label agreement + a once-only UMAP taxonomy diagnostic | minutes | **none** | 56, corroborating only |
+| ~~4~~ | ~~embedding kNN + UMAP~~ | — | — | **cut — see §4.4** |
 | **5** | LLM judge, constrained adjudication with evidence spans | ~375–600 calls | **real** | **288 rows = 6.2%** |
 | **6** | Human review | ~8 person-hours | none | **~200 rows** |
 
-Tiers 1–4 are free, deterministic given a seed, and carry **no contamination risk whatsoever** —
+Tier numbering is kept with tier 4 struck rather than renumbered, because renumbering would
+invalidate cross-references in three documents for no benefit.
+
+Tiers 1–3 are free, deterministic given a seed, and carry **no contamination risk whatsoever** —
 none of them writes a label opinion into the corpus. That is why they run first, and it is why the
 LLM tier is now a residual filter rather than the primary instrument. The earlier design sent
 every labelled row to a judge; this one sends 6.2% of them.
@@ -161,8 +164,51 @@ mislabelled. The confident-learning ranking is doing its job — it surfaces row
 disagrees with the label — but disagreement is not noise, and a pipeline that auto-drops or
 auto-relabels on that signal would have quietly degraded the dataset while reporting a cleaner one.
 
-Hence the invariant: **tiers 1–4 route, they never decide.** The delta is reported as a diagnostic
-and explicitly **not** used as a gate.
+Hence the invariant: **the cheap tiers route, they never decide.** The delta is reported as a
+diagnostic and explicitly **not** used as a gate.
+
+### 4.4 The embedding tier was measured and cut
+
+Tier 4 — embedding kNN label agreement plus a UMAP taxonomy plot — was validated adversarially by
+an agent that did not write it, with a default verdict of "cut". It did not survive. Full working
+in [`docs/specs/knn-tier-validation.md`](../specs/knn-tier-validation.md).
+
+**It made the cascade worse at matched reviewer budget**, which is the measurement that decides it.
+Injecting 3% known label errors and comparing recall over 3 seeds: tier 3 alone recovers 0.683 of
+ambiguous-pair errors at 185 rows; tier-3 top-129 plus tier-4 top-56 recovers **0.589**. That holds
+at every budget from 25 to 500 rows and under both representations — including the ambiguous-pair
+case tier 4 was supposed to be good at.
+
+Three supporting findings:
+
+- **Its unique flags are not wrong labels.** Dropping the 41 tier-4-only rows costs −0.42pp
+  macro-AP against −0.28pp for 41 *random* rows — worse than the control in all three seeds. The
+  same hard-but-correct character as §4.3, without tier 3's yield.
+- **The flag had no anchor.** Random neighbours give median disagreement 0.907, and 9.4% of rows
+  clear the ≥0.95 threshold by chance. The top-56 exceeds its own null by 0.012, and 17 of the 56
+  sit *below* it.
+- **Swapping representation replaces two thirds of the list.** The specified 56 flags came from a
+  TF-IDF cosine proxy; real `multilingual-e5-small` flags 36, overlapping the proxy's top-56 by
+  34%. So "downgrade to TF-IDF" is not the answer either — it keeps a useless list and only makes
+  it cheap.
+
+**UMAP fails separately and for its own reason.** The 2-D centroid geometry a human reads off the
+plot correlates with the true 384-dimension geometry at Spearman 0.011–0.239 and moves across
+seeds. Tier 2's per-service-pair confusion table is free, already computed, directional,
+base-rate-conditional and diffable between snapshots — and it recovers the fixture's planted
+ambiguities (`monitoring`↔`notifications`, `access-control`↔`auth`, `billing`↔`subscriptions`).
+It replaces the plot at no cost.
+
+**What cutting it buys:** `sentence-transformers`, `torch` (754 MB), `umap-learn` and a
+numba/llvmlite toolchain leave the pipeline, along with a 471 MB pinned checkpoint, a mirroring
+requirement, a whole class of fitted artifact, and two decision items. The freed 56 review slots go
+to widening the tier-3 selector, which is a measured improvement rather than just a smaller queue.
+
+One thing is deliberately **not** lost: the distance-to-centroid value was doubling as the
+out-of-distribution signal for [`llm-fallback-policy.md`](../specs/llm-fallback-policy.md) §2 case
+4. That requirement is real, but it is a **serving-time** signal whose threshold belongs on the
+production model's validation set — and the production classifier already has an encoder. It is
+handed off explicitly rather than deleted.
 
 ### 4.4 Getting the statistics right
 
@@ -207,7 +253,7 @@ specs.
 | PII | **`presidio`** (Apache-2.0) with **`slovnet`** as the RU NER backend | Presidio supplies the recogniser/anonymiser framing; its own Russian coverage is weak. **`scrubadub` rejected: no Russian at all.** Stated honestly: slovnet's published ORG F1 is 0.825, so roughly one company name in six is missed — which is why the egress gate exists |
 | Language ID | **`lingua-py`** | The only candidate with span-level code-switch output. This corpus has 237 rows of Russian prose with English error strings, and a Cyrillic-ratio rule gets 9 of them right. **fastText `lid.176` rejected on CC-BY-SA-3.0** |
 | Near-duplicates | **`datasketch`** MinHashLSH, two signatures unioned | **SimHash rejected: worse ARI at 45× the cost.** Two signatures because the 98-row alert clique is only visible at Jaccard 0.80 *before* boilerplate stripping — after it the largest cluster drops to 8 |
-| Label audit | **`scikit-learn`** (BSD-3) + **`cleanlab` 2.9.0** (Apache-2.0) + **`umap-learn`** (BSD-3) | Confident learning is the standard instrument for this and is well grounded (Northcutt et al., JAIR 2021). TF-IDF + LR was already a mandatory baseline in the parent spec — it was being computed and thrown away; here it also produces the out-of-sample probabilities tier 3 needs |
+| Label audit | **`scikit-learn`** (BSD-3) + **`cleanlab` 2.9.0** (Apache-2.0) | Confident learning is the standard instrument for this and is well grounded (Northcutt et al., JAIR 2021). TF-IDF + LR was already a mandatory baseline in the parent spec — it was being computed and thrown away; here it also produces the out-of-sample probabilities tier 3 needs |
 | Dataframes | **`polars`** + Parquet/Arrow | Columnar checkpoints, stable schema at every boundary |
 | Orchestration | **GNU `make` + a `ticketds` Typer CLI** | A 20-minute single-host batch job that gets iterated on, blocked once by a human. **Temporal rejected** (payloads force file-path passing; the human pause is a file, not a signal). **DVC was the strongest rival** — rejected because its cache would put un-redacted raw text in a second place we must remember to shred, and because it cannot express "the prompt changed, reuse 4,900 of 5,013 cached responses" |
 | Human review | **Generated XLSX round-trip** (`openpyxl`), HMAC-checked | ~200 rows, ≤3 reviewers, one batch. Zero infrastructure, zero auth, and no third party sees the data. **Argilla is the named upgrade trigger** if the queue exceeds ~1,500 rows or review becomes recurring. **Prodigy rejected**: closed source in a pipeline handling personal data, per-seat cost exceeding the project's entire LLM budget |
@@ -221,7 +267,7 @@ specs.
 | LLM | **$24.58** [estimate] | Phase 2 $19.40 (5,013 calls) + judge $5.18 (~375–600 calls over 288 rows). Mixed tier: Sonnet 5 for Phase 2, Opus 5 for the judge |
 | Rebuild after a code-only change | **$0** | Every response served from the replay cache |
 | Re-run the judge after a threshold tweak | **$2.60–5.20** | See below |
-| Machine | ~20 min CPU; **2–4 h elapsed** | Dominated by batch turnaround. 4 vCPU, 8 GB RAM, **no GPU** — embedding 50k rows is ~6 min on CPU |
+| Machine | **~2 min CPU** for the cheap tiers; **2–4 h elapsed** overall | Elapsed time is batch turnaround, not compute. 4 vCPU, 8 GB RAM, **no GPU, and no model checkpoint to pin or mirror** |
 | Human | **~25 person-hours**, of which ~8 h is the review queue | Balance is the Phase-3 calibration pilot and per-phase pipeline validation |
 
 **Cost is not a decision variable.** A full build costs less than an hour of engineering time. Any
@@ -270,8 +316,8 @@ annotation guideline is written, because the taxonomy diagnostics should inform 
   rows are excluded from val/test too.
 - **Two measurements behind the cascade are proxies**, recorded rather than buried: the
   drop-flagged-rows delta used global out-of-fold probabilities (mildly circular; the
-  implementation must use nested CV), and the tier-4 kNN numbers are a TF-IDF cosine stand-in for
-  embeddings.
+  implementation must use nested CV), and the injected-error study that cut tier 4 used synthetic
+  noise, which is not real noise — its flip conditions are recorded in the validation document.
 
 ### 7.1 One correction to an existing document
 
@@ -325,7 +371,7 @@ shrinks and the *handling* controls do not:
 | **D-6** | **Human budget: ~25 person-hours (~8 h queue), in addition to the ~70 h gold set** | Support lead | Confirm. **If only 70 h exist in total, spend all of it on the gold set and drop Phase 3.** Do not fund the queue out of the gold budget |
 | **D-7** | **Amend runbook §6** — org-grouped temporal splitting is infeasible (§7.1) | ML + product | Adopt the measured replacement and edit the runbook |
 | **D-8** | **Who authors the `auth` vs `access-control` tie-break rules?** | Product owner | Without written rules, judge and reviewer disagree on the same rows forever. This is the taxonomy's largest error source |
-| **D-9** | **Which embedding checkpoint for tier 4, pinned at which commit SHA?** | ML | Keep it **decoupled** from the production classifier checkpoint even if the same model is a candidate for both — coupling means changing the production model silently re-ranks the label audit of the corpus that trained it |
+| **D-9** | **The out-of-distribution signal for the LLM fallback needs a new home** | ML | Cutting tier 4 removes the distance-to-centroid value that was incidentally serving [`llm-fallback-policy.md`](../specs/llm-fallback-policy.md) §2 case 4. The requirement stands; it belongs at **serving time**, where the production classifier already has an encoder and the threshold can be set on that model's validation set. It never belonged in a dataset pipeline. Track it against the classifier spec, not this one |
 | **D-10** | **Raw-export retention: 30 days post-freeze** | Legal + ML | 30 days, on data minimisation (§8) |
 | **D-11** | **Repo layout `py/` rather than `pipeline/`** | User | `py/`. `packages/` reads as npm workspaces to every TypeScript developer who opens this repo |
 | **D-12** | **Does the real input arrive as a CSV export or a read-replica query?** | Backend / DBA | Either works; a query must archive its text and hash. A live query with no snapshot is the one thing forbidden |
@@ -349,7 +395,7 @@ label-quality report.**
 | 1–2 | Repo skeleton, `make` DAG, ingest, run report | — |
 | 3–4 | `ticketprep` package: normalise + redact + egress gate, golden test file | — |
 | 5a–d | Dedup, split, assemble, gates, freeze — wired straight from Phase 1 | — |
-| **5e** | **Conflict detection, TF-IDF baseline, confident learning, kNN + UMAP** | — |
+| **5e** | **Conflict detection, TF-IDF baseline, confident learning, taxonomy reports** | — |
 | 6–7 | LLM layer, replay cache, Phase 2 at `--limit 200`, then full corpus | D-1 |
 | 8 | Freeze verification + CI rebuild asserting version stability | — |
 | 9–11 | Judge on the residual, queue, XLSX round-trip, human review | D-6, D-8 |
