@@ -218,18 +218,28 @@ specs.
 
 | Resource | Full build | Notes |
 |---|---|---|
-| LLM | **~$25–30** [estimate] | Phase 2 (~5,013 calls, ~$19) now dominates; Phase 3 runs on 288 rows. The architecture doc's $32 was computed against a 1,400-row residual estimate and is an upper bound |
+| LLM | **$24.58** [estimate] | Phase 2 $19.40 (5,013 calls) + judge $5.18 (~375–600 calls over 288 rows). Mixed tier: Sonnet 5 for Phase 2, Opus 5 for the judge |
 | Rebuild after a code-only change | **$0** | Every response served from the replay cache |
+| Re-run the judge after a threshold tweak | **$2.60–5.20** | See below |
 | Machine | ~20 min CPU; **2–4 h elapsed** | Dominated by batch turnaround. 4 vCPU, 8 GB RAM, **no GPU** — embedding 50k rows is ~6 min on CPU |
 | Human | **~25 person-hours**, of which ~8 h is the review queue | Balance is the Phase-3 calibration pilot and per-phase pipeline validation |
 
 **Cost is not a decision variable.** A full build costs less than an hour of engineering time. Any
 review argument beginning "to save on LLM calls" should be treated with suspicion.
 
-One consequence of the cascade is worth noting because it reverses an earlier decision:
-**2-of-3 self-consistency on the judge was previously ruled out on budget** at 15,039 calls. Over a
-few-hundred-row residual it is affordable, so three opinions on the rows that matter now costs less
-than one opinion on every row did. It is back in the design.
+Two consequences of the cascade are worth stating, because both reverse earlier decisions:
+
+**Self-consistency is back.** It was ruled out on budget at 15,039 calls. The design now uses
+**escalating** self-consistency — one call per row, two more only where the first produced a reject
+or a proposal — which is ~375–600 calls over the 288-row residual. Against the original shape (one
+vote over all 5,013 rows, $45.12) this buys **three opinions where disagreement is possible for
+11.5% of the cost**. The $40 is not the point: the **contamination surface falls by the same
+order**, and that is what matters.
+
+**The judge has stopped being an expensive knob.** At $2.60–5.20 per re-run it is now cheaper to
+re-issue than several of the cheap tiers are to re-fit. **Phase 2 is the only genuinely costly
+thing left to change in the pipeline** — which is worth knowing before anyone starts iterating on
+prompts.
 
 ### 6.1 These numbers will grow on real data, and that is the plan
 
@@ -309,7 +319,7 @@ change.** So the *detection* tier shrinks and the *handling* controls do not:
 | **D-1** | **152-FZ: may pseudonymised ticket text leave the perimeter to a hosted LLM API?** | Legal / DPO | Blocks Phases 2–3 on production data, not on the fixture. Default config to `strict`, build the self-hosted provider path in parallel so a "no" costs a week rather than a redesign |
 | **D-2** | **Is the no-application-secrets premise a measurement or an assumption?** | Backend + security | If assumed, it costs one grep over a production export to check. The pipeline hedges either way, and reinstating the tier is a version bump plus a re-run |
 | **D-3** | **Is a self-hosted LLM available in-perimeter, and at what tier?** | Infra | Needed only if D-1 is "no". The provider seam makes it a config change |
-| **D-4** | **"At most one LLM call per row" — one *attempt* or one *accepted response*?** | User | One accepted response; 3 attempts max. One-attempt-only routes ~0.2–0.5% of rows to a human for a *formatting* failure, spending reviewer time on a machine problem |
+| **D-4** | **"At most one LLM call per row" — one *attempt* or one *accepted response*, and is the budget scoped per phase?** | User | One accepted response, 3 attempts max; one-attempt-only routes ~0.2–0.5% of rows to a human for a *formatting* failure, spending reviewer time on a machine problem. And **scoped per phase**: the judge's escalating self-consistency is up to three accepted responses per judged row by design. The arithmetic makes the case better than the argument — ~576 calls over 4,622 labelled rows is **0.12 calls per labelled row**, an order of magnitude under the Phase-2 budget it would be compared against. This is a confirmation request, not a request to relax anything |
 | **D-5** | **Run tiers 1–3 on a real export in week 1** to get the true label-noise rate | ML | Do it first. Four minutes of CPU, no LLM, no human, no approval — and it sizes everything downstream, including whether Phase 3's LLM tier is worth building |
 | **D-6** | **Human budget: ~25 person-hours (~8 h queue), in addition to the ~70 h gold set** | Support lead | Confirm. **If only 70 h exist in total, spend all of it on the gold set and drop Phase 3.** Do not fund the queue out of the gold budget |
 | **D-7** | **Amend runbook §6** — org-grouped temporal splitting is infeasible (§7.1) | ML + product | Adopt the measured replacement and edit the runbook |

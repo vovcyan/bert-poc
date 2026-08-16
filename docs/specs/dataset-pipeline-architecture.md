@@ -146,8 +146,8 @@ false-negative class is personal data and the only false-positive class is label
 | Rows | 5,013 (4,622 with a non-empty `services`, 391 empty) | [measured] on the fixture |
 | Text volume | 1.21 M chars of `title` + `description`; mean 241, median 231, p90 325, max 849 | [measured] |
 | Per-row prompt payload | ~180 tokens variable [estimate] (RU ≈ 2.5–3 chars/token, EN ≈ 4) | [estimate] |
-| LLM calls, full build | ≤ 5,013 (Phase 2, all rows) + **~1,400 (Phase 3, residual only)** = **~6,400**, down from ~10,026 | §6.2 |
-| LLM cost, full build | **$9 (Haiku 4.5) / $27 (Sonnet 5) / $45 (Opus 5)**, batch pricing, no cache hits; **$32** for the recommended mixed tier, or **$57** with 3-vote self-consistency on the residual — still below the old single-vote $65 | §6.2 |
+| LLM calls, full build | ≤ 5,013 (Phase 2, all rows) + **~375–600 (Phase 3, over a measured 288-row residual with escalating self-consistency)** ≈ **~5,600**, down from ~10,026 | §6.2 |
+| LLM cost, full build | **$7 (Haiku 4.5) / $21 (Sonnet 5) / $35 (Opus 5)** single-vote, batch pricing, no cache hits; **~$22** for the recommended mixed tier, **~$25** with escalating self-consistency. **Phase 2 is 79–88% of it; the judge is ~$5** | §6.2 |
 | LLM cost, rebuild after a code-only change | **$0** — every response is served from the replay cache | §6.4 |
 | Cheap-tier CPU cost (tiers 1–4) | **~2.5 min** at 5,013 rows; **~12 min** at 50,000 [estimate] — embedding dominates | §6.2 |
 | GPU | **not required at 50k rows either** — mE5-small INT8 does 143 tickets/s at 128 tokens [measured, spec §4.5] ⇒ 50k in ~6 min on 4 vCPU | §6.2 |
@@ -159,7 +159,8 @@ false-negative class is personal data and the only false-positive class is label
 engineer's time. Every trade-off below is decided on operational simplicity, reproducibility
 and blast radius — never on saving $30. Note that the cascade **is not justified by the $32
 it saves** — it is justified because tiers 1–4 produce a label-quality report with no LLM in
-it at all (§10), and because a 1,400-row LLM residual is a set a human can actually audit.
+it at all (§10), and because a [measured] 288-row LLM residual is a set a human can actually
+audit end to end.
 
 ---
 
@@ -1334,7 +1335,7 @@ two are local models, which is new in this revision.
 | `s43` (tier 2) | **local** TF-IDF + OvR LR, fitted here | 5,013 rows × 5 folds | none (~20 s) | `--skip-tier 2`, recorded |
 | `s45` (tier 4) | **local** sentence encoder, inference only, **no network** | 5,013 rows | none (~35 s) | `--skip-tier 4`, recorded |
 | `s20` (Phase 2) | remote LLM, per-row cleaning | ≤ 5,013 | none (batch, hours) | fail-open to Phase-1 text |
-| `s30` (tier 5) | remote LLM, label judging | **≤ 1,500 residual**, not 5,013 | none | fail-closed to the human queue |
+| `s30` (tier 5) | remote LLM, label judging | **288 rows [measured]**, ~375–600 calls, not 5,013 | none | fail-closed to the human queue |
 
 None of these is the production inference path. The production path is the ONNX classifier in
 `model_service` (proposal §5.3) and the LLM *fallback* (fallback policy §8) — different
@@ -1360,40 +1361,70 @@ Token budget per row [estimate], from the [measured] 241-char mean and RU≈2.7 
 | Phase 2 | 1,800 | 180 | **≤120** (edit list) |
 | Phase 3 | 2,600 (20 definitions + guideline) | 200 | ≤160 (verdicts + short evidence) |
 
-**Phase 3 now runs on a residual.** `judge.max_rows` defaults to **1,500** (≈32% of the 4,622
-labelled rows); expected fill ~1,400 [estimate]. It is a hard cap, not a threshold, for the
-same reason the review queue is (§5.4): otherwise a threshold change becomes a budget change.
+**Phase 3's input is measured, not estimated.** Cleaning §4.3's tier table puts the tier-5
+input at **288 rows = 6.2% of labelled rows** [measured on the fixture]. My earlier 1,400-row
+figure was a pre-measurement estimate made before the cascade's selection numbers existed;
+**it is superseded and appears nowhere else in this document.** `judge.max_rows` stays at
+**1,500** with the same relabelling the review capacity got in §5.4: a **non-binding backstop**
+against a pathological run, not a forecast — measured demand is 288, and a hard cap is still
+the right instrument because a threshold tweak must never silently become a budget change.
 
 Cost of one full build, **batch pricing (50%)**, no cache hits assumed, Phase 2 over 5,013
-rows and Phase 3 over 1,400:
+rows and Phase 3 over the measured 288 (single vote, 288 calls):
 
-| Model | Phase 2 (5,013) | Phase 3 (1,400) | Total | *Previously (P3 over 5,013)* |
+| Model | Phase 2 (5,013 rows) | Phase 3 (288 rows) | Total | *Rev-1 (P3 over 5,013)* |
 |---|---|---|---|---|
-| Claude Haiku 4.5 ($1 / $5) | $6.47 | $2.52 | **$8.99** | *$15.50* |
-| Claude Sonnet 5 ($3 / $15) | $19.40 | $7.56 | **$26.96** | *$46.47* |
-| Claude Opus 5 ($5 / $25) | $32.35 | $12.60 | **$44.95** | *$77.47* |
-| **Recommended mixed: Sonnet 5 (P2) + Opus 5 (P3)** | $19.40 | $12.60 | **$32.00** | *$64.52* |
+| Claude Haiku 4.5 ($1 / $5) | $6.47 | $0.52 | **$6.99** | *$15.50* |
+| Claude Sonnet 5 ($3 / $15) | $19.40 | $1.56 | **$20.96** | *$46.47* |
+| Claude Opus 5 ($5 / $25) | $32.33 | $2.59 | **$34.92** | *$77.47* |
+| **Recommended mixed: Sonnet 5 (P2) + Opus 5 (P3)** | $19.40 | $2.59 | **$21.99** | *$64.52* |
 
-[estimate], prices from fallback policy §7. **Recommendation unchanged: Sonnet 5 for Phase 2,
-Opus 5 for Phase 3.** Phase 2 is mechanical text surgery at high volume; Phase 3's output
-feeds label decisions and a human queue, and now that it runs on a residual the premium tier
-costs $12.60.
+[estimate on tokens, measured on rows], prices from fallback policy §7. My $2.59 for an Opus
+single-vote pass sits inside cleaning §4.3.9's independently-derived **≈$2–4**, which is a
+useful check that the two token budgets agree.
 
-**The cascade unlocks a decision I previously closed, and I am reopening it.** The previous
-revision ruled 2-of-3 self-consistency (fallback §4.2, cleaning §4.3.5) *out of budget*: at
-corpus scale it meant 15,039 calls. On a 1,400-row residual it is **4,200 calls**, and at Opus
-5 batch pricing that is **$37.80** — so:
+**Recommendation unchanged: Sonnet 5 for Phase 2, Opus 5 for Phase 3.** Phase 2 is mechanical
+text surgery at high volume; Phase 3's output feeds label decisions and a human queue, and at
+288 rows the premium tier costs $2.59. **Phase 2 now dominates the bill — 88% of it at single
+vote, 79% with escalating self-consistency below** — so any future effort to reduce LLM spend
+belongs there, not on the judge.
 
-| Configuration | LLM cost | What you get |
-|---|---|---|
-| Old shape: 1-vote judge over all 5,013 | $64.52 | one opinion on every row, including 3,600 rows nothing was suspicious about |
-| **New shape: 3-vote judge over the 1,400 residual** | **$57.20** | **three opinions, with disagreement as a routing signal, on exactly the rows four cheaper instruments could not settle** |
+**Self-consistency: reopened in rev-2, and now nearly free.** The rev-1 document ruled
+2-of-3 self-consistency (fallback §4.2, cleaning §4.3.9) *out of budget* at corpus scale —
+15,039 calls. I then re-costed it against a 1,400-row estimate at 4,200 calls / $57.20. Both
+are superseded. **Adopt cleaning §4.3.9's escalating scheme rather than an unconditional
+3-vote**: one call per judged row, then two more *only* where the first produced a reject or a
+proposal ([estimate] 40–60% of this pre-filtered pool), giving **~375–600 calls** — 576 at the
+50% midpoint, against 864 for unconditional 3-vote. It is strictly better: same information
+where disagreement is possible, no calls where it is not.
 
-For less money we get a better instrument pointed at a better-chosen set. Self-consistency by
-candidate-order shuffling (`derive(seed_root, "judge.candidate_order", ticket_id)` — a *fixed*
-shuffle per variant index, so all three prompts are cache-stable) is therefore **recommended
-on the residual**, and `judge.self_consistency` defaults to 3 rather than 1. Note this is
-three *accepted responses per row*, which needs D-4 confirmed the way I read it.
+| Judge configuration | Calls | Cost (Opus 5, batch) | What you get |
+|---|---|---|---|
+| Rev-1 shape: 1 vote over all 5,013 labelled rows | 5,013 | **$45.12** | one opinion on every row, including ~4,700 nothing was suspicious about |
+| 1 vote over the measured 288 | 288 | $2.59 | one opinion on the rows four cheaper instruments could not settle |
+| **Escalating ≤3 votes over the measured 288** ← **recommended** | **~375–600** | **$5.18** at 576 | **up to three opinions, with disagreement as a routing signal, on exactly those rows** |
+| Unconditional 3 votes over the 288 | 864 | $7.78 | the same, plus 288 wasted calls on rows the first pass cleared |
+
+The argument is stronger than it was when I made it against the 1,400 estimate. Then, three
+opinions on the residual merely *undercut* one opinion on the corpus. Now it costs **11% of
+it** — $5.18 against $45.12 — while pointing a better instrument at a set chosen by four
+independent cheaper ones. That is not a cost saving worth arguing about in absolute terms
+($40); it is a **contamination-surface** reduction of the same order, which is the thing that
+actually matters (cleaning §4.3.9 makes the same point and is right to).
+
+Mechanism: candidate-order shuffling via `derive(seed_root, "judge.candidate_order",
+ticket_id)` — a *fixed* shuffle per variant index, so all three prompts are cache-stable —
+never temperature, which current models reject with a 400 (fallback §4.2).
+
+**On the call budget, stated plainly so nobody has to infer it.** Escalating self-consistency
+means **up to three accepted responses for a judged row, by design**. That does not conflict
+with the user's "at most one LLM call per row" constraint, because that constraint is
+**scoped per phase**: it bounds Phase 2, which calls once per row over all 5,013 rows.
+Phase 3 is a separate phase with a separate budget, and cleaning §4.3.9 reads it the same way.
+The corpus-wide arithmetic makes the point better than the argument does: Phase 3 issues
+~576 calls over 4,622 labelled rows = **0.12 calls per labelled row**, an order of magnitude
+*under* the Phase-2 budget it is being compared against. D-4 confirms the reading; it is not
+a request to relax the constraint.
 
 **Cheap-tier CPU cost**, using the [measured] figures already in the parent spec:
 
@@ -1519,15 +1550,15 @@ one.
 | Split ratios, gap days, `org_purge_jaccard`, `seed_root` | `s51`→`s55` | $0 | — | ~1 min |
 | Review verdicts returned / a new round added | `s50`→`s55` | $0 | — | ~2 min |
 | Queue capacity, stratum shares, priority function | `s41`→ human → … | $0 | — | mins + human |
-| **Tier-4 `k`, distance metric, kNN params** | `s45`→`s46`→`s30`→… | **P3 re-issue if the residual set changes (~$13)** | ~5 s (embeddings cached) | ~1 h |
+| **Tier-4 `k`, distance metric, kNN params** | `s45`→`s46`→`s30`→… | **P3 re-issue if the residual set changes (~$5)** | ~5 s (embeddings cached) | ~1 h |
 | **Tier-3 parameters** | `s44`→`s46`→`s30`→… | as above | ~2 s | ~1 h |
 | **Tier-2 hyperparameters, `n_splits`, or the fold seed** | `s43`→`s44`→`s46`→`s30`→… | as above | ~20 s | ~1 h |
 | **Tier-4 embedding checkpoint or `revision`** | `s45`→… **and re-embeds everything** | as above | **~35 s** | ~1 h |
 | **`sklearn` / `cleanlab` version bump** | `s43`/`s44` onward — `params_sha256` is unchanged but the *fitted* hash is not, so this is caught, not missed (§4.8) | as above | ~25 s | ~1 h |
-| Phase-3 prompt, judge model, or `self_consistency` | `s30`→`s55` | **P3 only (~$13, or ~$38 at 3 votes)** | — | ~1 h |
-| Phase-2 prompt or cleaner model | `s20`→`s55`, **and all four cheap tiers** (they read cleaned text) | **P2 (~$19) + P3 re-issue (~$13)** | ~2.5 min | ~2 h |
+| Phase-3 prompt, judge model, or `self_consistency` | `s30`→`s55` | **P3 only (~$2.60 single-vote, ~$5.20 escalating)** | — | ~1 h |
+| Phase-2 prompt or cleaner model | `s20`→`s55`, **and all four cheap tiers** (they read cleaned text) | **P2 (~$19) + P3 re-issue (~$5)** | ~2.5 min | ~2 h |
 | **`gold_ids.json` redrawn** | `s29`→ everything downstream. **Refused by default** — see §6.7 | full P3 | ~2.5 min | ~2 h |
-| **`ticketprep` normalisation or redaction (MAJOR)** | **everything**; all cache keys change because the rendered payload changes | **full (~$32)** | ~2.5 min | ~2–4 h |
+| **`ticketprep` normalisation or redaction (MAJOR)** | **everything**; all cache keys change because the rendered payload changes | **full (~$25)** | ~2.5 min | ~2–4 h |
 | A new raw export | everything | full | ~2.5 min | ~2–4 h + human |
 
 Three readings of this table:
@@ -1537,9 +1568,12 @@ Three readings of this table:
   nothing at all in LLM spend. Tuning a judge prompt used to be the only knob and it cost
   $45 a turn.
 - **Phase 2 got more expensive to change**, because tiers 2–4 read its output. That is a real
-  cost of the ordering decision in §2.2 and it is worth ~$13 and 2.5 minutes.
+  cost of the ordering decision in §2.2 and it is worth ~$5 and 2.5 minutes.
 - **Everything below the tier rows is expensive and should be**: changing what the model
-  *sees* must invalidate what the model *said*.
+  *sees* must invalidate what the model *said*. Note the shape of the table after the
+  re-costing: **the judge is no longer an expensive knob at all** — at $2.60–5.20 a turn it is
+  cheaper to re-run than most of the cheap tiers are to re-fit. Phase 2 is now the only
+  genuinely costly thing to change.
 
 ### 6.5 The train/serve skew seam — `ticketprep`
 
@@ -1615,7 +1649,7 @@ offline batch build to a running service, and inverts the dependency).
 | Idempotency | there is no provider-level idempotency key for single messages, so **the cache is the idempotency mechanism**: responses are written and fsynced individually before any aggregation, so a retried row that already succeeded is a cache hit, not a second charge. For batches, `custom_id` (= the cache key) makes re-fetch idempotent |
 | Refusals / safety stops | recorded as `status="refused"` with the stop reason; routed like a validation failure (fail-open in P2, to the queue in P3). Never retried with a modified prompt automatically — that is a semantics change and belongs to ml-researcher |
 | Timeouts | per-request 120 s (online); batch poll every 30 s with a `batch_max_wait` of 24 h, after which the stage fails with the batch id recorded so it can be resumed |
-| N-of-M self-consistency | **now affordable and recommended**, because the cascade cut the judge's input to ~1,400 rows: 3 votes = 4,200 calls = $37.80 at Opus 5 batch (§6.2). `judge.self_consistency: 3`, varied by candidate-order shuffle, never by temperature (fallback §4.2). The previous revision ruled this out at 15,039 calls; the cascade changed the arithmetic and therefore the answer |
+| N-of-M self-consistency | **now recommended and nearly free**, because the cascade cut the judge's input to a [measured] 288 rows. Use cleaning §4.3.9's **escalating** scheme — 1 call, +2 only on a reject or proposal — for ~375–600 calls ≈ **$5.18** at Opus 5 batch (§6.2), not an unconditional 3-vote. Varied by candidate-order shuffle, never by temperature (fallback §4.2). Rev-1 ruled this out at 15,039 calls; the cascade changed the arithmetic and therefore the answer |
 
 ### 6.7 The gold-set fence
 
@@ -1946,8 +1980,8 @@ Collected; the reasoning is in the section named.
 | **Tier-3 implementation (§4.8)** | `cleanlab`, multi-label API | `cleanlab`'s **multi-class** API — silently assumes one correct label per row and would flag every 2–4-service ticket; **hand-rolling the confident-joint rank** — buys nothing, since `cleanlab` is maintained, tested and Apache-2.0, and the edge cases it handles are exactly the ones a 50-line reimplementation gets wrong |
 | **Embedding matrix location (§3.4)** | a side `.npy` keyed to row order, hashed in the manifest | a `list<float32>[384]` corpus column — triples corpus size for something no consumer of the corpus reads |
 | **UMAP's role (§3.4)** | once-only human diagnostic, never a routing input | using the 2-D projection to select rows for review — the layout depends on its own seed and neighbourhood parameters, and routing humans on a stochastic projection is not defensible |
-| **Self-consistency (§6.2, §6.6)** | 3 votes **on the residual** | 1 vote over the whole corpus (the previous revision's answer — more expensive *and* weaker, once the cascade exists); N-of-M by temperature (rejected on current models, fallback §4.2) |
-| **Judge input sizing (§6.2)** | hard cap `judge.max_rows`, default 1,500 | a score threshold — makes a threshold tweak into an unbudgeted spend, the same failure the review capacity cap exists to prevent |
+| **Self-consistency (§6.2, §6.6)** | **escalating ≤3 votes** on the measured 288-row residual (~375–600 calls, $5.18) | 1 vote over the whole corpus (rev-1's answer — 9× the cost and a weaker instrument); **unconditional 3 votes** on the residual (864 calls, $7.78 — 288 of them on rows the first pass already cleared); N-of-M by temperature (rejected on current models, fallback §4.2) |
+| **Judge input sizing (§6.2)** | measured demand (288), with `judge.max_rows` = 1,500 as a **non-binding backstop** | a score threshold with no cap — makes a threshold tweak into an unbudgeted spend, the same failure the review capacity cap exists to prevent; sizing from my rev-2 1,400-row *estimate* — superseded by cleaning §4.3's measurement |
 | **Secret scanning in the data path (§8.2)** | **removed** (C10) | keeping `gitleaks`/`detect-secrets`/entropy "just in case" — [measured, cleaning §2.4] 0/81 URL tokens exceed the base64 entropy limit and 40% fall below the hex limit, so it neither works nor has a threat to work on. Retained **only** as a pre-commit guard on our own source tree (§8.5) |
 | **The egress gate after C10 (§8.2)** | kept, re-justified on 152-FZ and irreversibility, and made two-sided | deleting it along with the secret tier — the regulated act is moving *personal data*, and it is regulated whether or not a key travelled with it |
 
@@ -2014,10 +2048,10 @@ runs.
 | **D-1** | **The cascade's tier semantics are not yet written.** `dataset-pipeline-cleaning.md` now exists and covers Phases 1–2 and the judge, but the tier-1–4 criteria — conflict threshold, `t2_missing_threshold`, cleanlab parameters, `k` and the agreement metric, and which `flag_reasons` map to `route = human_direct` vs `llm_judge` — are the respecification in flight | ml-researcher | Write them against the schemas in §3.4. **Three of my constraints are runtime, not preference, and should not be re-litigated as ML choices**: the O(edits) Phase-2 schema and its ≤120/≤160 output-token budgets (§6.2); folds keyed on `dedup_cluster_id` (§4.5, F-17); and tiers emit scores + a reason, never a decision (§3.4) |
 | **D-2** | **Runbook §6's "group by `organization_id`" is not implementable with a temporal split** — measured: 100% of test rows share an org with train; a strict purge leaves 0 test rows (§3.5) | ml-researcher + product | Adopt §3.5's replacement (cluster grouping + org-conditioned near-dup purge at J≥0.50, costing 1.4% of test) and **amend runbook §6** so the next reader is not misled. Report `org_overlap_rate` and the seen-org/unseen-org metric split permanently |
 | **D-3** | **152-FZ: may redacted ticket text go to a hosted LLM API?** (spec §8 Q7, fallback §7) | Legal / DPO | Blocks step 7 of §10 for production data, not for the synthetic fixture. Default the config to `strict` and build step 13 in parallel so a "no" costs a week, not a redesign. **Do not start Phase 2 on a production export before this lands** |
-| **D-4** | **"At most one LLM call per row" — one *attempt* or one *accepted response*?** (§1.4c) | user | One accepted response, 3 attempts max, `1.05 × rows` budget per run. One-attempt-only sends ~0.2–0.5% of rows [estimate] to the human queue for a formatting reason, which wastes reviewer time on a machine problem |
+| **D-4** | **"At most one LLM call per row" — one *attempt* or one *accepted response*, and is it per phase?** (§1.4c, §6.2) | user | **Two separate readings, both needed, and neither is a request to relax the constraint.** (a) *One accepted response*, 3 attempts max, `1.05 × rows` budget per run — one-attempt-only sends ~0.2–0.5% of rows [estimate] to the human queue for a formatting reason, wasting reviewer time on a machine problem. (b) **The constraint is scoped per phase.** It bounds Phase 2 at one call per row over all 5,013 rows. Phase 3's escalating self-consistency is **up to three accepted responses per judged row by design**, and that is a separate budget line — it covers a [measured] 288 rows, so ~576 calls over 4,622 labelled rows = **0.12 calls/labelled row**, an order of magnitude *under* the Phase-2 budget. Cleaning §4.3.9 reads it the same way |
 | **D-5** | **Reviewer capacity — a much smaller ask than the last revision claimed.** ~200 queue rows × 2.5 min ≈ **8 h**, ~**25 h** including the calibration pilot and per-phase validation, *additional* to the runbook §4.2 gold-set 70 h | Support lead | Both my earlier figures (12.5 h) and proposal §7.1's reconciliation (~44 h) are withdrawn; cleaning §4.3.11's measured tier-selection counts supersede them. **The binding input is no longer reviewer availability — it is the real base reject rate**, which is unknown until tiers 1–3 run on the production export (four minutes of CPU, no human, no LLM). Ask for a *provisional* 25 h and re-derive before committing; the realistic contaminated-column case is ~400–700 rows ≈ 17–29 h. The 600-row cap stays as a non-binding backstop |
 | **D-6** | **Raw-export retention: 30 days post-freeze** (§8.3) — **the answer is unchanged by C10 but the recorded reason changes** | Legal + DPO + ML | 30 days, justified by **personal-data minimisation and irreversibility**, not by credential exposure (which C10 removed). §8.3 shows the reasoning. I would accept 90 days for the *first* production build only, auto-expiring and recorded in the manifest, on the grounds that the first run is the one most likely to need raw re-derivation while detectors are still being tuned |
-| **D-7** | **Model tier: Sonnet 5 (P2) + Opus 5 (P3); ~$32/build single-vote, ~$57 with 3-vote self-consistency on the residual** (§6.2) | ML + whoever owns the budget | As proposed, **and take the self-consistency**: 3 votes on 1,400 rows costs less than the previous revision's 1 vote on 5,013 and is a strictly better instrument. Revisit only if per-tier precision (step 11) shows the judge adding nothing over tiers 1–4 — in which case the right move is to cut the judge, not to downgrade its tier |
+| **D-7** | **Model tier: Sonnet 5 (P2) + Opus 5 (P3); ~$22/build single-vote, ~$25 with escalating self-consistency** (§6.2) | ML + whoever owns the budget | As proposed, **and take the self-consistency** — it costs $2.60 more and is a materially better instrument. Note the shape of the bill after re-costing against the measured 288-row residual: **Phase 2 is ~79% of it and the judge is ~$5**. Any effort to reduce LLM spend belongs on Phase 2. Revisit the tier only if per-tier precision (step 11) shows the judge adding nothing over tiers 1–4 — in which case the right move is to cut the judge entirely (D-13), not to downgrade it |
 | **D-8** | **`allow_unpartitioned_eval` for the fixture.** The fixture has no `ticket_messages`, so no label in it is verifiably human (§1.2) | ML | `true` for the fixture only, with `provenance_complete: false` banner-printed in every report. **Never** for a production build — that flag existing at all is a risk, and it should be `false` in `pipeline.default.yaml` |
 | **D-9** | Does the eventual real input arrive as a CSV export or a read-replica query? | Backend / DBA | Either works; a query needs `export_query_sha256` populated and the query text archived. **A live query with no snapshot is the one thing C2 forbids** |
 | **D-10** | Repo layout `py/` vs the brief's `pipeline/` (§1.4d) | user | `py/`. Cheap to change now, expensive after 200 imports exist |
