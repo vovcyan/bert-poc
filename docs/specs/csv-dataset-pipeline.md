@@ -403,13 +403,22 @@ because the keywords are mangled too. **[measured]** the 9 rows include a person
 forwarded email header, a `.env` paste described as `боевой` (production), and a document-requisites
 block. Every one of them would sail through §4's detectors untouched.
 
-**Therefore: repair runs in S0, before redaction in S2.** Rows that fail to round-trip cleanly are
-quarantined rather than passed through — an un-repairable encoding is a row we cannot claim to
-have redacted.
+**Therefore: S0 reads raw bytes without lossy replacement, attempts the documented codec repair,
+and only then hands text to S2.** `encoding_errors='replace'` must **not** be used: it destroys the
+undecodable bytes before repair can run, and a row whose original content has been overwritten with
+U+FFFD is a row we can no longer prove we redacted. Rows that cannot be decoded by any configured
+codec are quarantined with `quarantine_reason = "undecodable"`, retaining a SHA-256 of the original
+bytes for auditability — never the bytes themselves, which would put unredacted content in an
+output artifact.
+
+**[measured]** on this corpus, zero rows fail to decode as UTF-8 and 9 need the CP1251 repair. The
+strict-decode path therefore costs nothing here and is the difference between a provable claim and
+a hopeful one on a real export.
 
 - **In:** `data/raw/tickets_export.csv`
 - **Out:** `stage/s0_ingest.parquet` — all 10 source columns as `Utf8`, plus `row_index`
-- **Quarantine:** column count mismatch, missing `id`, duplicate `id`, unparseable `created_at`
+- **Quarantine:** column count mismatch, missing `id`, duplicate `id`, unparseable `created_at`,
+  `undecodable` (no configured codec repairs the row — §S0 above)
 - **Acceptance:** 5,013 rows in, 5,013 accounted for; `id` unique; `updated_at >= created_at`
 
 ### S1 — `normalize-labels`
@@ -466,8 +475,8 @@ Runs **after** S2 — evidenced in §1.3.
 1. **Exact:** SHA-256 of `title_redacted + "\n" + description_redacted`. **[measured]** 6 rows.
 2. **Near:** MinHash (128 permutations) over character 5-grams of the redacted text, LSH banding
    for candidates, exact Jaccard to confirm. Two thresholds, both recorded:
-   - `≥ 0.80` → **[measured]** 464 pairs — same-text clusters; drop all but the earliest from
-     train, and never allow across a split boundary
+   - `≥ 0.80` → **[measured]** 464 pairs — same-text clusters; keep only the earliest, quarantining
+     the rest with `dup_exact` (S3 marks them; S7 enforces the boundary rule)
    - `≥ 0.60` → **[measured]** 599 pairs, 371 rows — flag as a cluster, keep, but never split a
      cluster across the train/test boundary
 3. Assign `dup_cluster_id` via connected components over the ≥0.60 graph.
@@ -611,7 +620,7 @@ writing production code:
 | СНИЛС | 13 | 13 |
 | JWT | 9 | 9 |
 | PEM private key header | 4 | 4 |
-| Partial self-redaction (`***`, `REDACTED`) | 335 | 168 |
+| Partial self-redaction (`***`, `REDACTED`, `XXXX`, `####`) | 335 | 168 |
 | **Rows with ≥1 sensitive hit** | | **1,226 (24.5%)** |
 
 Now compare against what `data/raw/README.md` says is actually in the file:
@@ -631,7 +640,7 @@ Now compare against what `data/raw/README.md` says is actually in the file:
    remember that a partial PAN is still cardholder data.
 2. **The 274-row gap is mostly not PII** — pasted k8s manifests, nginx configs, stack traces. They
    carry internal infrastructure identifiers, which is a *different* sensitivity class, and the
-   reason `<HOST>` and `<PATH>` exist in Appendix A.
+   reason `<HOST>` exists in Appendix A.
 3. **A plausible IBAN regex found zero of the IBANs that are actually there.** `[A-Z]{2}\d{2}[A-Z0-9]{11,30}`
    matched **0**; the same pattern allowing spaces between groups matched **16**
    (`FR00 3000 3000 0000 0000 0000`). Nobody types an IBAN unspaced. The same
@@ -642,6 +651,16 @@ Now compare against what `data/raw/README.md` says is actually in the file:
 > the data." It usually means your pattern is wrong. **Every detector that finds zero must fail
 > the build until a human either fixes it or records why zero is genuinely expected.** This is a
 > test (§9), not a convention.
+
+> **A note on the self-redaction count, because it does not match the corpus README.**
+> `data/raw/README.md` reports **173** rows with partial self-redaction; the predicate above finds
+> **168**, and adding Russian self-description verbs (`скрыт`, `заменил`, `замаскировал`) finds
+> **181**. No text predicate reproduces 173, because the README's number is the *generator's own
+> bookkeeping* — it knows which rows it wrote a self-redaction into, which is not a property
+> recoverable from the text. **We use 168 and state the predicate**, because a number a reader can
+> recompute beats a number that came from somewhere they cannot check. The 3% gap is not an error
+> in either count; it is two different definitions, and this is exactly why a measured claim
+> without its predicate is not a measurement.
 
 ### 4.4 The Luhn trap
 
@@ -684,7 +703,7 @@ Full vocabulary in Appendix A. Three decisions worth arguing:
 manifest" is evidence for `compute`. Collapsing both to `<REDACTED>` throws away a feature that
 correlates with the label you are trying to predict.
 
-**(b) Coarse in text, fine in the sidecar.** Twelve placeholders reach the text. The detector's
+**(b) Coarse in text, fine in the sidecar.** Thirteen placeholders reach the text. The detector's
 finer type (`INN` vs `KPP` vs `OGRN`, all → `<ORG_ID>`) is kept in `s2_spans.parquet`. The model
 does not benefit from distinguishing ИНН from КПП — but an auditor asking "did we ever miss an
 ОГРН" absolutely does. Text carries what the model needs; the sidecar carries what the auditor
@@ -719,7 +738,7 @@ the sensitive spans are. So we make a small ground truth:
 | Rows with ≥1 detected span | 80 | measures precision, catches over-redaction |
 | Rows with a payload but **no** detected span | 60 | **the highest-value stratum — this is where misses live** |
 | Random rows with no payload | 40 | catches false positives on ordinary prose |
-| Rows with partial self-redaction | 20 | **[measured]** 168 such rows; the format most likely to break a detector |
+| Rows with partial self-redaction | 20 | **[measured]** 168 such rows under the predicate below; the format most likely to break a detector |
 
 **[estimate]** ~200 rows × ~3 min = **10 person-hours**, once. Every miss it finds becomes a
 regression test.
@@ -843,10 +862,24 @@ pretending you missed nothing.
 | Random control | 150 | catches misses in ordinary prose |
 | | **~790** | |
 
-**The prompt asks one question**, and its narrowness is what makes it work: *"Here is a support
-ticket in which an automated system has already replaced sensitive values with placeholders. List
-any remaining span that is a personal, financial, corporate, or authentication identifier."*
-Structured output: a list of `{start, end, text, entity_type, why}`.
+**The request carries three things, and all three are required.** Sending the redacted text alone
+makes misses invisible — a value that was never replaced looks like ordinary prose. Sending the raw
+text alone makes the model re-report everything S2 already caught, burying the handful of real
+misses in hundreds of confirmations. So each call sends:
+
+1. the **original** text (this is the raw-text egress §5.3 gates),
+2. the **redacted** text S2 produced from it,
+3. the **span list** from `s2_spans.parquet` — character offsets into the original, already covered.
+
+The prompt then asks one narrow question: *"Below is a support ticket, the redacted form an
+automated system produced from it, and the character ranges that system already replaced. Report
+only spans in the original that are a personal, financial, corporate, or authentication identifier
+**and are not covered by a listed range**."* Structured output: a list of
+`{start, end, text, entity_type, why}`, offsets into the original.
+
+Overlap with a known span is then re-checked in code, not trusted from the model: any returned span
+intersecting an S2 span is dropped before the queue is written. The model's job is nomination;
+set arithmetic is the pipeline's.
 
 **What happens to the output — the whole design in four steps:**
 
@@ -872,9 +905,22 @@ Even with 152-FZ off the table (Assumption 5), the sequencing matters and genera
 - **S6 must see the original**, because its job is finding what redaction missed. You cannot audit
   a redactor using only its output.
 
-That is a real, unavoidable tension. Our resolution: **S6 sends only its ~790-row sample, only the
-raw text, logged explicitly, and gated behind `llm.allow_raw_text: true`** — a flag that must be
-set deliberately and that the manifest records for every run.
+That is a real, unavoidable tension. Our resolution: **S6 sends only its ~790-row sample, and only
+under `llm.allow_raw_text: true`** — a flag that must be set deliberately and that the manifest
+records for every run.
+
+**What that means for the default build, stated explicitly because the default config ships with the
+flag `false`:**
+
+| Invocation | S6 behaviour |
+|---|---|
+| `run` with `allow_raw_text: false` (the default) | S6 is **skipped**. The manifest records `s6: skipped (allow_raw_text=false)`, and the datasheet states that redaction recall is unaudited for this build |
+| `run --audit-redaction` with the flag `false` | **Fails immediately** with an explicit error naming the flag. Never a silent skip when the stage was asked for |
+| `run --audit-redaction` with the flag `true` | S6 runs |
+
+A skipped S6 is a **publishable but unaudited** dataset version — usable for pipeline development,
+not for a version anyone trains a shipping model on. Success criterion 8 (§12) applies only to
+builds where S6 ran; the manifest is what distinguishes them, so nobody has to remember.
 
 On this synthetic corpus this is theatre. **On production data it is the control that makes the
 stage legal or not**, and building the switch now costs nothing while retrofitting it later means
@@ -951,8 +997,14 @@ producing **train 3,237 / val 621 / test 627**, with **137 rows (3.0%) discarded
 > `quarantine_reason = "split_gap"`, not deleted — §3 rule 1.
 
 **Cluster rule:** any `dup_cluster_id` from S3 spanning a boundary is assigned wholesale to the
-**earlier** split, and its later members are dropped from the later split. Rationale: keeping a
+**earlier** split, and its later members are removed from the later split. Rationale: keeping a
 duplicate in train is harmless; keeping one in test inflates the score.
+
+**"Removed" means quarantined, not deleted** — §3 rule 1 has no exceptions, and the row-accounting
+assertion in §12 would otherwise fail. Removed members go to `quarantine.parquet` with
+`quarantine_reason ∈ {dup_exact, dup_cross_boundary}`, `quarantine_stage = "s7"`, and their
+`dup_cluster_id`, so the surviving twin is always findable. The manifest reports both counts
+separately: a large `dup_cross_boundary` count is a finding about the corpus, not bookkeeping.
 
 **Also produce a random split**, purely as the drift diagnostic classifier spec §2.6 requires.
 Never train on it. **[measured]** the leakage difference is already known — 6.2% versus 3.7% of
@@ -1049,8 +1101,12 @@ forgotten under deadline.
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
 
-# Full build (LLM stages read from cache when warm)
+# Full build (LLM stages read from cache when warm).
+# S6 redaction audit is SKIPPED unless llm.allow_raw_text is true — see §5.3.
 python -m ticketds.cli run --config configs/dataset.v1.yaml
+
+# Build including the S6 redaction audit. Fails loudly if llm.allow_raw_text is false.
+python -m ticketds.cli run --config configs/dataset.v1.yaml --audit-redaction
 
 # One stage, against the cached predecessor — the iteration loop for redaction work
 python -m ticketds.cli stage redact --config configs/dataset.v1.yaml
@@ -1278,7 +1334,9 @@ Each is mechanically checkable — that is the point.
 6. Splits are leak-free by the §10 checks; the manifest reports the random-vs-temporal leakage
    delta.
 7. `review/labels.jsonl` holds 400 ranked rows; queue precision on the first human pass ≥0.30.
-8. S6 audits ~790 rows; every confirmed miss has a rule and a regression test.
+8. **On builds where S6 ran** (`--audit-redaction`, §5.3): ~790 rows audited, and every confirmed
+   miss has a rule and a regression test. Builds that skipped S6 are marked unaudited in the
+   manifest and datasheet, and are not eligible to train a shipping model.
 9. `datasheet.md` opens with §1.8's warning, and names every `measurable: false` service.
 10. A teammate who has not read this document can run the pipeline from `README` alone and get
     hash-identical output.
@@ -1301,8 +1359,10 @@ Blocking ones first. Each needs an owner before the affected stage is built.
 
 ## Appendix A — Placeholder vocabulary
 
-Twelve placeholders reach the text. The detector's finer `entity_type` is preserved in
-`s2_spans.parquet` (§4.5b).
+Thirteen placeholders reach the text — enumerated here and nowhere else. `configs/redaction.yaml`,
+the closed-vocabulary test (§10) and the model-input contract all read this one list; a count
+written into prose anywhere else is a second source of truth and a bug waiting to happen. The
+detector's finer `entity_type` is preserved in `s2_spans.parquet` (§4.5b).
 
 ### A.1 Redaction — safety, never disabled
 
@@ -1347,7 +1407,8 @@ seed: 20260820                       # every stochastic step derives from this
 input:
   path: data/raw/tickets_export.csv
   encoding: utf-8
-  encoding_errors: replace           # flag U+FFFD rows, keep them (S0)
+  encoding_errors: strict            # NEVER 'replace' — it destroys bytes before repair (S0)
+  mojibake_repair: [cp1251]          # codecs tried, in order, on the Latin-1-supplement signature
 
 taxonomy: configs/taxonomy.yaml
 redaction:
